@@ -137,6 +137,7 @@ Places::Places(const QString &home, QObject *parent)
     m_trashSettle.setInterval(150);
     connect(&m_trashSettle, &QTimer::timeout, this, &Places::refreshTrash);
     connect(&m_trashWatcher, &QFileSystemWatcher::directoryChanged, &m_trashSettle, qOverload<>(&QTimer::start));
+    connect(&m_trash, &QFutureWatcherBase::finished, this, &Places::trashRead);
 
     // Drives get plugged in and folders come and go: a gentle poll keeps
     // the sidebar honest without any background service.
@@ -215,33 +216,51 @@ bool Places::anyTrashed(const QStringList &trashDirs) {
     return false;
 }
 
-void Places::refreshTrash() {
+Places::Trash Places::readTrash() {
+    Trash trash;
     const QStringList dirs = FileOps::trashDirs();
     // Each trash's files folder; and the trash itself, which sees files/
     // made, or the whole trash removed and made again by something that
     // empties it that way. With no home trash yet, where it will be made.
-    QStringList watch;
     for (const QString &dir : dirs) {
         for (const QString &path : {dir + "/files", dir})
             if (QFileInfo(path).isDir())
-                watch << path;
+                trash.watch << path;
     }
     const QString home = FileOps::homeTrash();
     if (!QFileInfo(home).isDir() && QFileInfo(QFileInfo(home).absolutePath()).isDir())
-        watch << QFileInfo(home).absolutePath();
+        trash.watch << QFileInfo(home).absolutePath();
+    trash.full = anyTrashed(dirs);
+    return trash;
+}
+
+void Places::refreshTrash() {
+    // Every mounted drive is looked at for a trash of its own, so it's done
+    // off the UI thread, one look at a time, as the mounts are read: a
+    // network mount slow to answer never holds up the window.
+    if (m_trash.isRunning()) {
+        m_rereadTrash = true;
+        return;
+    }
+    static QThreadPool *const pool = new QThreadPool;
+    m_trash.setFuture(QtConcurrent::run(pool, &Places::readTrash));
+}
+
+void Places::trashRead() {
+    const Trash trash = m_trash.result();
     const QStringList watched = m_trashWatcher.directories();
     for (const QString &path : watched)
-        if (!watch.contains(path))
+        if (!trash.watch.contains(path))
             m_trashWatcher.removePath(path);
-    for (const QString &path : watch)
+    for (const QString &path : trash.watch)
         if (!watched.contains(path))
             m_trashWatcher.addPath(path);
-
-    const bool full = anyTrashed(dirs);
-    if (full != m_trashFull) {
-        m_trashFull = full;
+    if (trash.full != m_trashFull) {
+        m_trashFull = trash.full;
         emit trashChanged();
     }
+    if (std::exchange(m_rereadTrash, false))
+        refreshTrash();
 }
 
 QString Places::configPath() const {

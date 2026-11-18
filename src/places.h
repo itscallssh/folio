@@ -46,6 +46,10 @@ public:
     // holds anything. Stops at the first item, so a trash of thousands
     // costs no more than one of one.
     static bool anyTrashed(const QStringList &trashDirs);
+    // Looks again at whether the trash is full, and watches the folders
+    // that say so. Folio's own deleting asks too, since a drive's first
+    // trash folder is made where nothing watches yet.
+    Q_INVOKABLE void refreshTrash();
 
     // Home's folders can be left out of its section (Hide in the sidebar's
     // menu) and put back (Show in Home in the folder's own menu, in home).
@@ -107,9 +111,13 @@ private:
     QStringList readBookmarkLines() const;
     bool writeBookmarkLines(const QStringList &lines);
     QString userDirectory(int location, const QString &fallback) const;
-    // Looks again at whether the trash is full, and watches the folders
-    // that say so.
-    void refreshTrash();
+    // Whether the trash is full, and the folders to watch that say so.
+    struct Trash {
+        QStringList watch;
+        bool full = false;
+    };
+    static Trash readTrash();
+    void trashRead();
 
     QString m_home;
     bool m_realHome;
@@ -123,6 +131,9 @@ private:
     QFileSystemWatcher m_trashWatcher;
     QTimer m_trashSettle;
     bool m_trashFull = false;
+    QFutureWatcher<Trash> m_trash;
+    // Another look was asked for while one was under way.
+    bool m_rereadTrash = false;
     QFutureWatcher<QList<Mount>> m_mounts;
     // Another refresh was asked for while one was reading.
     bool m_rereadMounts = false;

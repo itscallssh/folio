@@ -165,6 +165,12 @@ Rectangle {
         target: places
         function onFailed(message) { sidebar.target.showMessage(message) }
     }
+    // Something deleted here may have made a drive's first trash folder,
+    // which nothing watches yet: the trash's icon looks again.
+    Connections {
+        target: fileOps
+        function onHistoryChanged() { places.refreshTrash() }
+    }
 
     component SectionLabel: Text {
         Layout.topMargin: 21

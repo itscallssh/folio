@@ -4169,6 +4169,24 @@ private slots:
         QCOMPARE(backend.title(), QString("Trash"));
     }
 
+    void trashSaysWhenItHoldsSomething()
+    {
+        // Looked at off the UI thread, and watched: something put in the
+        // trash, even before its folder exists, shows the full trash.
+        QTemporaryDir home, data;
+        const auto restore = dataHomeAt(data.path());
+        Places places(home.path());
+        QSignalSpy changed(&places, &Places::trashChanged);
+        QTest::qWait(300);
+        QVERIFY(!places.trashFull());
+        QDir().mkpath(data.filePath("Trash/files"));
+        write(data.filePath("Trash/files/gone.txt"), "x");
+        QTRY_VERIFY(places.trashFull());
+        QFile::remove(data.filePath("Trash/files/gone.txt"));
+        QTRY_VERIFY(!places.trashFull());
+        QCOMPARE(changed.count(), 2);
+    }
+
     void placesListEveryFolderInHome()
     {
         QTemporaryDir home;
