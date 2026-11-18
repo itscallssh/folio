@@ -59,6 +59,8 @@ ApplicationWindow {
     // Columns on a first launch; after that, whichever view was used last.
     property string viewMode: "columns"
     property real zoom: 1
+    // The list's own size step, apart from the grid's.
+    property real listZoom: 1
 
     // The pane keys, the sidebar and the details go to.
     property var activePane: leftPane
@@ -78,6 +80,7 @@ ApplicationWindow {
     Settings {
         property alias viewMode: win.viewMode
         property alias zoom: win.zoom
+        property alias listZoom: win.listZoom
     }
 
     // Ctrl+Alt+N: a second pane on the right, starting where the active
@@ -92,6 +95,7 @@ ApplicationWindow {
             rightPane.closable = true
             rightPane.viewMode = activePane.viewMode
             rightPane.zoom = activePane.zoom
+            rightPane.listZoom = activePane.listZoom
             rightPane.closeRequested.connect(closeSplit)
         }
         rightPane.focusView()

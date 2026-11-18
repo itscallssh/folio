@@ -19,13 +19,24 @@ FileListView {
     // Where the keyboard's menu (Alt+Return) opens: beside the cursor's item.
     function menuAnchor() { return currentItem }
 
-    Selecting { id: selecting; view: list; pageStep: Math.max(1, Math.floor(list.height / 32) - 1) }
+    // Rows grow with the size step, as the grid's tiles do with theirs: their
+    // height and picture, not the name and details. A value outside the
+    // steps (a hand-edited setting) is held to the ends.
+    property real zoom: 1
+    readonly property real rowZoom: Math.max(1, Math.min(zoom, 2))
+    readonly property int rowHeight: Math.round(32 * rowZoom)
+    signal zoomRequested(int step)
+    ZoomWheel { onZoomRequested: (step) => list.zoomRequested(step) }
+    // The rows reflow, so bring the cursor's row back into view.
+    onRowHeightChanged: Qt.callLater(() => { if (currentIndex >= 0) { forceLayout(); positionViewAtIndex(currentIndex, ListView.Contain) } })
+
+    Selecting { id: selecting; view: list; pageStep: Math.max(1, Math.floor(list.height / list.rowHeight) - 1) }
     onCurrentIndexChanged: selecting.cursorMoved()
     Keys.onPressed: (event) => selecting.page(event) || selecting.extendBy(event, event.key === Qt.Key_Up ? -1 : event.key === Qt.Key_Down ? 1 : 0)
 
     Band {
         view: list
-        rectOf: (i) => Qt.rect(0, i * 32, list.width, 32)
+        rectOf: (i) => Qt.rect(0, i * list.rowHeight, list.width, list.rowHeight)
     }
 
     // → opens the selected folder in place, and on one open already steps
@@ -82,6 +93,7 @@ FileListView {
 
     delegate: FileRow {
         width: list.width
+        zoom: list.rowZoom
         detailed: true
         tree: backend.folder.expandable
         current: selected

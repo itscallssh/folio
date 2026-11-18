@@ -33,9 +33,31 @@ FocusScope {
     property real zoom: host ? host.zoom : 1
     onZoomChanged: if (host && !closable) host.zoom = zoom
     readonly property var zoomSteps: [0.75, 1, 1.25, 1.5, 2]
+    // The list's rows have steps of their own, three: its normal size, and
+    // two bigger. They're kept apart from the grid's, so each view is
+    // remembered at the size it was left at.
+    property real listZoom: host ? host.listZoom : 1
+    onListZoomChanged: if (host && !closable) host.listZoom = listZoom
+    readonly property var listZoomSteps: [1, 1.5, 2]
+    // The step `step` away from `current` among `steps`, held to the ends; a
+    // value that's none of them (a hand-edited setting) counts as normal.
+    function stepped(steps, current, step) {
+        const at = steps.indexOf(current)
+        return steps[Math.max(0, Math.min(steps.length - 1, (at < 0 ? steps.indexOf(1) : at) + step))]
+    }
+    // The keys and the wheel size what's showing: the list's rows, or else
+    // the grid's tiles.
     function zoomBy(step) {
-        const at = zoomSteps.indexOf(zoom)
-        zoom = zoomSteps[Math.max(0, Math.min(zoomSteps.length - 1, (at < 0 ? 1 : at) + step))]
+        if (viewMode === "list")
+            listZoom = stepped(listZoomSteps, listZoom, step)
+        else
+            zoom = stepped(zoomSteps, zoom, step)
+    }
+    function resetZoom() {
+        if (viewMode === "list")
+            listZoom = 1
+        else
+            zoom = 1
     }
     function cycleView() {
         viewMode = viewMode === "columns" ? "list" : viewMode === "list" ? "grid" : "columns"
@@ -205,7 +227,7 @@ FocusScope {
     Shortcut { sequence: "Ctrl+3"; enabled: pane.active; onActivated: pane.viewMode = "grid" }
     Shortcut { sequences: [StandardKey.ZoomIn, "Ctrl+="]; enabled: pane.active; onActivated: pane.zoomBy(1) }
     Shortcut { sequences: [StandardKey.ZoomOut]; enabled: pane.active; onActivated: pane.zoomBy(-1) }
-    Shortcut { sequence: "Ctrl+0"; enabled: pane.active; onActivated: pane.zoom = 1 }
+    Shortcut { sequence: "Ctrl+0"; enabled: pane.active; onActivated: pane.resetZoom() }
     Shortcut { sequences: ["Return", "Enter"]; enabled: pane.keys; onActivated: if (pane.current.path) backend.open(pane.current.path) }
     Shortcut { sequences: ["Backspace", "Alt+Up"]; enabled: pane.keys; onActivated: backend.goUp() }
     Shortcut { sequences: ["Alt+Left", "Back"]; enabled: pane.active; onActivated: backend.back() }
@@ -483,7 +505,7 @@ FocusScope {
             }
         }
         Component { id: gridView; FolderGrid { zoom: pane.zoom; onZoomRequested: (step) => pane.zoomBy(step) } }
-        Component { id: listView; FolderList { } }
+        Component { id: listView; FolderList { zoom: pane.listZoom; onZoomRequested: (step) => pane.zoomBy(step) } }
         Component { id: columnsView; FolderColumns { detailsPane: pane } }
     }
 

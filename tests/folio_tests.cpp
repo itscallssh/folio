@@ -1473,6 +1473,7 @@ private slots:
                 width: 900; height: 620; visible: true
                 property string viewMode: "columns"
                 property real zoom: 1
+                property real listZoom: 1
                 property bool split: false
                 property bool helpVisible: false
                 property var activePane: null
@@ -1543,6 +1544,7 @@ private slots:
                 width: 900; height: 620; visible: true
                 property string viewMode: "columns"
                 property real zoom: 1
+                property real listZoom: 1
                 property bool split: false
                 property bool helpVisible: false
                 property var activePane: null
@@ -8027,6 +8029,7 @@ private slots:
                 width: 900; height: 620; visible: true
                 property string viewMode: "list"
                 property real zoom: 1
+                property real listZoom: 1
                 property bool split: false
                 property bool helpVisible: false
                 property var activePane: null

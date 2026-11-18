@@ -72,7 +72,7 @@ Rectangle {
         ]},
         { title: qsTr("View"), shortcuts: [
             [qsTr("Columns, list or grid"), [["Ctrl", "1"], ["Ctrl", "2"], ["Ctrl", "3"]]],
-            [qsTr("Bigger, smaller or normal tiles"), [["Ctrl", "="], ["Ctrl", "-"], ["Ctrl", "0"]]],
+            [qsTr("Bigger, smaller or normal tiles and rows"), [["Ctrl", "="], ["Ctrl", "-"], ["Ctrl", "0"]]],
             [qsTr("Next or previous sort order"), [["S"], ["Shift", "S"]]],
             [qsTr("Show hidden files"), [["Ctrl", "H"]]],
             [qsTr("Reload"), [["F5"]]]

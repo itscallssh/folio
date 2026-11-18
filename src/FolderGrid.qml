@@ -73,22 +73,7 @@ GridView {
     property real zoom: 1
     readonly property real tileZoom: Math.max(0.5, Math.min(zoom, (width - 40) / 128))
     signal zoomRequested(int step)
-    WheelHandler {
-        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-        acceptedModifiers: Qt.ControlModifier
-        // A touchpad sends many small deltas: a step per notch's worth
-        // (120), and nothing for an event that doesn't move up or down.
-        property real pending: 0
-        onWheel: (event) => {
-            // Every whole notch is a step; the rest waits for the next event.
-            pending += event.angleDelta.y
-            while (Math.abs(pending) >= 120) {
-                const step = pending > 0 ? 1 : -1
-                grid.zoomRequested(step)
-                pending -= step * 120
-            }
-        }
-    }
+    ZoomWheel { onZoomRequested: (step) => grid.zoomRequested(step) }
     // The rows reflow, so bring the cursor's tile back into view.
     onTileZoomChanged: Qt.callLater(() => { if (currentIndex >= 0) { forceLayout(); positionViewAtIndex(currentIndex, GridView.Contain) } })
     readonly property int columns: Math.max(1, Math.floor(width / (40 + 128 * tileZoom)))

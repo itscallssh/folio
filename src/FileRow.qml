@@ -34,12 +34,16 @@ Item {
     // In the list, a tree: each level indented, and a folder's arrow opens
     // it in place (or closes it).
     property bool tree: false
+    // How much bigger than the columns' rows this one is: its height and
+    // its picture grow, the name and details don't, as with the grid's
+    // tiles. The list sets it from its size step.
+    property real zoom: 1
 
     signal clicked(int modifiers)
     signal activated()
     signal toggled()
 
-    implicitHeight: 32
+    implicitHeight: Math.round(32 * zoom)
 
     // The name always gets room: in a narrow window the date goes first,
     // then the size. (The icon says what kind a file is; there's no column
@@ -80,7 +84,13 @@ Item {
 
     RowLayout {
         anchors.fill: parent
-        anchors.leftMargin: row.tree ? 4 + row.depth * 20 : 14
+        // Each level is indented by half the picture's width plus a fixed
+        // 10: an open folder's items have their arrow under the folder's
+        // own picture at any size. (The arrow is a fixed 18 wide, so
+        // indenting by the picture's whole width, which grows twice as
+        // fast as the picture's middle moves, left the arrows drifting
+        // further out with every size step.)
+        anchors.leftMargin: row.tree ? 4 + row.depth * (Math.round(10 * row.zoom) + 10) : 14
         anchors.rightMargin: 14
         spacing: 12
 
@@ -109,8 +119,8 @@ Item {
         }
 
         Item {
-            implicitWidth: 20
-            implicitHeight: 20
+            implicitWidth: Math.round(20 * row.zoom)
+            implicitHeight: Math.round(20 * row.zoom)
             Image {
                 id: thumb
                 anchors.fill: parent
@@ -132,8 +142,8 @@ Item {
             }
             Rectangle {
                 id: rowMask
-                width: 20
-                height: 20
+                width: Math.round(20 * row.zoom)
+                height: Math.round(20 * row.zoom)
                 radius: Math.min(4, theme.radius)
                 visible: false
                 layer.enabled: true
@@ -142,7 +152,7 @@ Item {
                 anchors.centerIn: parent
                 visible: !thumb.visible
                 name: row.glyph
-                size: 16
+                size: Math.round(16 * row.zoom)
                 color: row.isDir && !row.cut ? theme.accent : theme.secondaryForeground
             }
         }
