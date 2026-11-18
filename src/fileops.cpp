@@ -4,6 +4,7 @@
 
 #include <QClipboard>
 #include <QDir>
+#include <QEventLoopLocker>
 #include <QFileInfo>
 #include <QFutureWatcher>
 #include <QGuiApplication>
@@ -22,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -38,6 +40,7 @@
 static QList<FileOps::Change> s_undo, s_redo;
 static QList<FileOps *> s_everyone;
 static constexpr int historyLength = 50;
+static constexpr int stopCheckMs = 100;
 
 // Work under way in this Folio, whichever pane started it. Panes work side
 // by side, but an undo or redo runs alone, so nothing changes the items it
@@ -148,6 +151,10 @@ bool FileOps::shiftHeld() {
     return QGuiApplication::queryKeyboardModifiers() & Qt::ShiftModifier;
 }
 
+bool FileOps::altHeld() {
+    return QGuiApplication::queryKeyboardModifiers() & Qt::AltModifier;
+}
+
 void FileOps::copy(const QStringList &paths) {
     if (!paths.isEmpty())
         QGuiApplication::clipboard()->setMimeData(mimeDataFor(paths, false));
@@ -222,8 +229,14 @@ static bool writeAll(int fd, const char *data, qint64 size) {
 // it's made with them, so a private file is never open to others while it's
 // copied.
 static bool copyFile(const QString &from, const QString &to, FileOps::Job *job) {
-    QFile in(from), out(to);
-    if (!in.open(QIODevice::ReadOnly) || !out.open(QIODevice::WriteOnly | QIODevice::NewOnly, in.permissions()))
+    QFile in, out(to);
+    // An open that waits would hold a pipe nobody writes to, or a file another program holds a lease on, out of Stop's reach; the lease is asked for again until it's given up.
+    int source;
+    while ((source = ::open(QFile::encodeName(from).constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC)) < 0
+           && errno == EWOULDBLOCK && !(job && job->cancelled))
+        ::usleep(stopCheckMs * 1000);
+    if (source < 0 || !in.open(source, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle)
+        || !out.open(QIODevice::WriteOnly | QIODevice::NewOnly, in.permissions()))
         return false;
     bool kernel = true, ok = true;
     QByteArray buffer;
@@ -244,12 +257,16 @@ static bool copyFile(const QString &from, const QString &to, FileOps::Job *job) 
                 continue;
             }
         } else {
+            // Read only what's there: a pipe with no writer yet reads as ended, and a silent one would hold the copy out of Stop's reach.
+            pollfd waiting{in.handle(), POLLIN, 0};
+            if (::poll(&waiting, 1, stopCheckMs) <= 0)
+                continue;
             buffer.resize(1 << 20);
             n = ::read(in.handle(), buffer.data(), buffer.size());
             if (n > 0 && !writeAll(out.handle(), buffer.constData(), n))
                 n = -1;
         }
-        if (n < 0 && errno == EINTR)
+        if (n < 0 && (errno == EINTR || errno == EAGAIN))
             continue;
         if (n <= 0) {
             ok = n == 0;
@@ -793,7 +810,10 @@ bool FileOps::inBackground(const std::function<QString(const Job &)> &label, Wor
     auto *timer = new QTimer(watcher);
     connect(timer, &QTimer::timeout, this, [this, job, label] { setBusy(label(*job)); });
     timer->start(200);
-    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, timer, job, done = std::move(done)] {
+    // Closing the last window doesn't quit Folio under the work: it runs on
+    // until `done` has finished it, and whatever `done` starts holds on too.
+    auto running = std::make_shared<QEventLoopLocker>();
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, timer, job, running, done = std::move(done)] {
         timer->stop();
         watcher->deleteLater();
         m_job.reset();
@@ -1355,7 +1375,11 @@ QString FileOps::trashOne(const QString &path, QString *error) {
 }
 
 QString FileOps::homeTrash() {
-    return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "/Trash";
+    // The trash is told from paths once they're cleaned, and cleaning takes
+    // link/.. to the folder beside link, not to where link leads.
+    const QString data = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    const QString real = data.split('/').contains("..") ? QFileInfo(data).canonicalFilePath() : QString();
+    return (real.isEmpty() ? data : real) + "/Trash";
 }
 
 QStringList FileOps::trashDirs() {
@@ -1371,12 +1395,29 @@ QStringList FileOps::trashDirs() {
     return dirs;
 }
 
-bool FileOps::inTrash(const QString &path) const {
+// The trash folder whose files `path` is among, read from the path: asking
+// every mounted drive would stall the window on one that doesn't answer.
+static QString trashFor(const QString &path) {
     const QString clean = QDir::cleanPath(path);
-    for (const QString &dir : trashDirs())
-        if (clean == dir + "/files" || clean.startsWith(dir + "/files/"))
-            return true;
-    return false;
+    const auto under = [&clean](const QString &dir) { return clean == dir + "/files" || clean.startsWith(dir + "/files/"); };
+    if (const QString home = QDir::cleanPath(FileOps::homeTrash()); under(home))
+        return home;
+    // A drive's own, at its top; the innermost, as a drive can be mounted in
+    // another's trash. The only drive asked is the one named there.
+    const QString uid = QString::number(getuid());
+    QString found;
+    for (const QString &marker : {"/.Trash-" + uid, "/.Trash/" + uid}) {
+        for (qsizetype at = clean.indexOf(marker + "/files"); at >= 0; at = clean.indexOf(marker + "/files", at + 1)) {
+            const QString dir = clean.left(at + marker.size()), top = at == 0 ? QStringLiteral("/") : clean.left(at);
+            if (dir.size() > found.size() && under(dir) && QStorageInfo(top).rootPath() == top)
+                found = dir;
+        }
+    }
+    return found;
+}
+
+bool FileOps::inTrash(const QString &path) const {
+    return !trashFor(path).isEmpty();
 }
 
 QString FileOps::infoFileFor(const QString &trashedPath) {
@@ -1386,10 +1427,8 @@ QString FileOps::infoFileFor(const QString &trashedPath) {
     // happens to be called "info".
     const QFileInfo item(trashedPath);
     const QString folder = QDir::cleanPath(item.absolutePath());
-    for (const QString &dir : trashDirs())
-        if (folder == QDir::cleanPath(dir + "/files"))
-            return dir + "/info/" + item.fileName() + ".trashinfo";
-    return {};
+    const QString dir = trashFor(folder);
+    return !dir.isEmpty() && folder == dir + "/files" ? dir + "/info/" + item.fileName() + ".trashinfo" : QString();
 }
 
 QString FileOps::originalPath(const QString &trashedPath) {
@@ -1403,9 +1442,8 @@ QString FileOps::originalPath(const QString &trashedPath) {
         if (path.startsWith('/'))
             return path;
         // A drive's own trash records paths from the top of that drive.
-        const QString trashDir = QFileInfo(QFileInfo(trashedPath).absolutePath()).absolutePath();
-        const QString top = trashDir.contains("/.Trash/") ? trashDir.section("/.Trash/", 0, 0)
-                                                          : QFileInfo(trashDir).absolutePath();
+        const QString up = QFileInfo(QFileInfo(QFileInfo(trashedPath).absolutePath()).absolutePath()).absolutePath();
+        const QString top = QFileInfo(up).fileName() == ".Trash" ? QFileInfo(up).absolutePath() : up;
         return QDir(top).filePath(path);
     }
     return {};
@@ -1604,6 +1642,7 @@ QString FileOps::rename(const QString &path, const QString &name) {
         return QFileInfo::exists(destination) ? tr("%1 already exists here.").arg(clean)
                                               : tr("Couldn't rename %1.").arg(info.fileName());
     remember({Renaming, info.fileName(), 1, {identified({false, destination, path})}});
+    emit renamed(path, destination);
     emit done(info.absolutePath(), clean);
     return {};
 }
@@ -1907,6 +1946,12 @@ void FileOps::step(bool undoing) {
                 sayStopped(job);
             else
                 emit notice(didMessage(change, undoing));
+            // A rename undone or redone moves the item back or on again;
+            // each flipped step is now at `path`, from `other`.
+            if (change.kind == Renaming)
+                for (const Step &step : result.steps.mid(result.left))
+                    if (!step.trash && !step.folder)
+                        emit renamed(step.other, step.path);
             // What's back in a folder is selected there, as after a paste.
             for (const Step &step : result.steps.mid(result.left))
                 if (!step.folder && (!step.trash || step.other.isEmpty())) {
@@ -1924,6 +1969,57 @@ static QString mimeFor(const QString &path) {
     return QFileInfo(path).isDir() ? QStringLiteral("inode/directory") : QMimeDatabase().mimeTypeForFile(path).name();
 }
 
+QString FileOps::omarchyEditor() {
+    QFile setting(QDir::homePath() + "/.local/state/omarchy/defaults/editor");
+    QString editor = setting.open(QIODevice::ReadOnly) ? QString::fromUtf8(setting.readLine()).trimmed() : QString();
+    // sublime-text-4 ships subl; older settings say sublime_text.
+    if (editor == "sublime_text")
+        editor = "subl";
+    if (editor.isEmpty() || QStandardPaths::findExecutable(editor).isEmpty())
+        editor = "nvim";
+    return editor;
+}
+
+QString FileOps::editorAppName(const QVariantList &apps) {
+    const QString editor = omarchyEditor();
+    for (const QVariant &app : apps)
+        if (QFileInfo(app.toMap().value("executable").toString()).fileName() == editor)
+            return app.toMap().value("name").toString();
+    return {};
+}
+
+QVariantList FileOps::foldHandlerRepeats(QVariantList apps) {
+    if (apps.isEmpty() || apps.first().toMap().value("id") != "omarchy-launch-editor.desktop"
+        || !apps.first().toMap().value("isDefault").toBool())
+        return apps;
+    const QString name = apps.first().toMap().value("name").toString();
+    for (qsizetype i = apps.size() - 1; i > 0; --i)
+        if (apps.at(i).toMap().value("name").toString() == name)
+            apps.removeAt(i);
+    return apps;
+}
+
+// An app's name, except Omarchy's editor handler, which opens text files in
+// the editor picked under Setup > Default > Editor: it's named after that
+// editor (Visual Studio Code, Neovim), found as the app that runs it, rather
+// than its own "Editor".
+static QString appName(GAppInfo *app) {
+    const QString own = QString::fromUtf8(g_app_info_get_name(app));
+    if (qstrcmp(g_app_info_get_id(app), "omarchy-launch-editor.desktop") != 0)
+        return own;
+    QVariantList visible;
+    GList *all = g_app_info_get_all();
+    for (GList *l = all; l; l = l->next) {
+        auto *info = G_APP_INFO(l->data);
+        if (const char *executable = g_app_info_get_executable(info); executable && g_app_info_should_show(info))
+            visible << QVariantMap{{"executable", QString::fromUtf8(executable)},
+                                   {"name", QString::fromUtf8(g_app_info_get_name(info))}};
+    }
+    g_list_free_full(all, g_object_unref);
+    const QString name = FileOps::editorAppName(visible);
+    return name.isEmpty() ? own : name;
+}
+
 QString FileOps::defaultAppName(const QString &mime) {
     if (mime.isEmpty() || mime == "inode/directory")
         return {};
@@ -1934,7 +2030,7 @@ QString FileOps::defaultAppName(const QString &mime) {
     g_free(type);
     if (!app)
         return {};
-    const QString name = QString::fromUtf8(g_app_info_get_name(app));
+    const QString name = appName(app);
     g_object_unref(app);
     return name;
 }
@@ -1994,8 +2090,7 @@ QVariantList FileOps::appsFor(const QString &path) const {
         // even a hidden one (Omarchy's editor handler), so it can be named.
         if (!g_app_info_should_show(info) && id != defaultId)
             continue;
-        const QVariantMap app{{"id", id}, {"name", QString::fromUtf8(g_app_info_get_name(info))},
-                              {"isDefault", id == defaultId}};
+        const QVariantMap app{{"id", id}, {"name", appName(info)}, {"isDefault", id == defaultId}};
         if (id == defaultId)
             apps.prepend(app);
         else
@@ -2003,7 +2098,10 @@ QVariantList FileOps::appsFor(const QString &path) const {
     }
     g_list_free_full(all, g_object_unref);
     g_free(type);
-    return apps;
+    // Named after Neovim, the editor handler and Neovim itself would be two
+    // entries of one name: the handler, which follows the picked editor,
+    // stands for both.
+    return foldHandlerRepeats(apps);
 }
 
 void FileOps::openWith(const QString &path, const QString &appId) {
@@ -2056,7 +2154,9 @@ QProcess *FileOps::runTool(const QString &program, const QStringList &args, cons
     m_killed = false;
     claim(Lane::Files);
     setBusy(busy);
-    connect(process, &QProcess::finished, this, [this, process, finished, stopped](int code, QProcess::ExitStatus status) {
+    // As for work in the background, closing the last window waits for it.
+    auto running = std::make_shared<QEventLoopLocker>();
+    connect(process, &QProcess::finished, this, [this, process, finished, stopped, running](int code, QProcess::ExitStatus status) {
         process->deleteLater();
         m_process = nullptr;
         release();
@@ -2068,7 +2168,7 @@ QProcess *FileOps::runTool(const QString &program, const QStringList &args, cons
     });
     // A program that isn't installed never finishes, so this is the only
     // word from it.
-    connect(process, &QProcess::errorOccurred, this, [this, process, missing](QProcess::ProcessError error) {
+    connect(process, &QProcess::errorOccurred, this, [this, process, missing, running](QProcess::ProcessError error) {
         if (error != QProcess::FailedToStart)
             return;
         process->deleteLater();

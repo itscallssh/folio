@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
 
 // The breadcrumb path from the left edge; view buttons on the right. Back and
@@ -6,8 +7,6 @@ import QtQuick.Layouts
 Rectangle {
     id: bar
 
-    property bool previewVisible: true
-    property bool previewFits: true
     property string viewMode: "grid"
     // Ctrl+L: the path as text to edit. Enter goes there (or connects to a
     // server's address), Escape cancels, Tab completes a folder name.
@@ -15,7 +14,10 @@ Rectangle {
     // The right pane of a split has a close button (Ctrl+W).
     property bool closable: false
     signal closeRequested()
-    signal togglePreview()
+    // The window's last bar has a quiet ? before its buttons, for finding the
+    // shortcuts without knowing the key that shows them.
+    property bool showsHelp: false
+    signal helpRequested()
     signal cycleView()
     signal editDone()
 
@@ -28,6 +30,18 @@ Rectangle {
     function stopEditing() {
         editing = false
         editDone()
+    }
+    // Opens one of the bar's menus with the keyboard in it. A path being
+    // typed, here or in the pane keys go to, is put away first: left to
+    // lose its focus to the menu, it would hand the keyboard back to the
+    // files from under the open menu.
+    function openMenu(menu, button) {
+        const pane = ApplicationWindow.window ? ApplicationWindow.window.activePane : null
+        if (pane && pane.editingPath)
+            pane.focusView()
+        if (editing)
+            stopEditing()
+        menu.popup(button, LayoutMirroring.enabled ? button.width - menu.width : 0, button.height + 4)
     }
 
     // /: search this folder and every folder below it, as you type. The
@@ -65,7 +79,9 @@ Rectangle {
     RowLayout {
         anchors.fill: parent
         anchors.leftMargin: 26
-        anchors.rightMargin: 20
+        // A file chooser's buttons sit as close to the window's edges as
+        // the bar's own sit to the top: 12 all round.
+        anchors.rightMargin: chooser ? 12 : 20
         spacing: 4
 
 
@@ -93,8 +109,18 @@ Rectangle {
             visible: bar.searching && !bar.editing
             font.pixelSize: 14
             // Room at the end for where it searches; padding isn't mirrored.
-            leftPadding: LayoutMirroring.enabled ? scope.implicitWidth + 24 : 12
-            rightPadding: LayoutMirroring.enabled ? 12 : scope.implicitWidth + 24
+            leftPadding: LayoutMirroring.enabled ? scope.implicitWidth + 24 + searchingSpinner.room : 12
+            rightPadding: LayoutMirroring.enabled ? 12 : scope.implicitWidth + 24 + searchingSpinner.room
+            // Turning while the search goes through the folders, beside
+            // where it searches.
+            Spinner {
+                id: searchingSpinner
+                readonly property int room: visible ? width + 10 : 0
+                visible: backend.folder.loading && backend.folder.query.length > 0
+                anchors.right: scope.left
+                anchors.rightMargin: 10
+                anchors.verticalCenter: parent.verticalCenter
+            }
             // Where it searches, at the end of the field. Unlike a
             // placeholder, it stays while typing. Plugins' views have
             // nothing below them.
@@ -188,13 +214,78 @@ Rectangle {
         }
 
         Item { implicitWidth: 16 }
+        // First of the buttons, before those for the folder shown.
+        AbstractButton {
+            id: help
+            visible: bar.showsHelp
+            // As wide as the buttons beside it, the ? itself smaller.
+            implicitWidth: 36
+            implicitHeight: 36
+            focusPolicy: Qt.NoFocus
+            hoverEnabled: true
+            text: qsTr("Keyboard shortcuts")
+            Accessible.name: text
+            onClicked: bar.helpRequested()
+            ToolTip {
+                visible: help.hovered
+                delay: 600
+                text: help.text
+                enter: null
+                exit: null
+            }
+            contentItem: Item {
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: 22
+                    height: 22
+                    radius: width / 2
+                    color: "transparent"
+                    border.width: 1
+                    border.color: help.hovered ? theme.foreground : Qt.alpha(theme.secondaryForeground, 0.4)
+                    Text {
+                        anchors.centerIn: parent
+                        text: "?"
+                        font.pixelSize: 13
+                        color: help.hovered ? theme.foreground : Qt.alpha(theme.secondaryForeground, 0.6)
+                    }
+                }
+            }
+            background: null
+        }
+        // In a file chooser, the app's filters when it gives a choice of
+        // them: a menu under the button, which names the one in use on
+        // hover. The right pane of a split leaves them to the left one.
+        IconButton {
+            id: filterButton
+            visible: !!chooser && chooser.filters.length > 1 && !bar.closable
+            glyph: "filter"
+            text: chooser ? chooser.filters[chooser.filter] || "" : ""
+            active: filterMenu.visible
+            // A second click closes it, as the sort button's does.
+            onClicked: filterMenu.visible ? filterMenu.close() : bar.openMenu(filterMenu, filterButton)
+            FolioMenu {
+                id: filterMenu
+                // A press on the button is left to its click, which closes it.
+                closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
+                Repeater {
+                    model: chooser ? chooser.filters : []
+                    FolioMenuItem {
+                        required property int index
+                        required property string modelData
+                        text: modelData
+                        checked: index === chooser.filter
+                        onTriggered: chooser.filter = index
+                    }
+                }
+            }
+        }
         // Shows the current view; clicking moves to the next one.
         IconButton {
             glyph: bar.viewMode
             // Names what a click does, like the buttons beside it.
-            text: bar.viewMode === "grid" ? qsTr("Show as list")
-                : bar.viewMode === "list" ? qsTr("Show as columns")
-                : qsTr("Show as grid")
+            text: bar.viewMode === "columns" ? qsTr("Show as list")
+                : bar.viewMode === "list" ? qsTr("Show as grid")
+                : qsTr("Show as columns")
             onClicked: bar.cycleView()
         }
         IconButton {
@@ -204,16 +295,21 @@ Rectangle {
             text: sortMenu.current.tip
             active: sortMenu.visible
             // Under the button, reaching toward the files.
-            onClicked: sortMenu.popup(sortButton, LayoutMirroring.enabled ? sortButton.width - sortMenu.width : 0, sortButton.height + 4)
+            // A second click closes it.
+            onClicked: sortMenu.visible ? sortMenu.close() : bar.openMenu(sortMenu, sortButton)
         }
-        SortMenu { id: sortMenu }
-        IconButton {
-            glyph: "preview"
-            // Only where the window has room to show them.
-            visible: bar.previewFits
-            text: qsTr("Details")
-            active: bar.previewVisible
-            onClicked: bar.togglePreview()
+        // Ctrl+F opens the filters from the keyboard, the name field
+        // included: the funnel, like the buttons beside it, takes no Tab.
+        Shortcut {
+            sequence: "Ctrl+F"
+            enabled: filterButton.visible && !filterMenu.visible
+            onActivated: bar.openMenu(filterMenu, filterButton)
+        }
+        SortMenu {
+            id: sortMenu
+            // A press on the button it opens under is left to the button's
+            // click, which closes it.
+            closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
         }
         IconButton {
             visible: bar.closable

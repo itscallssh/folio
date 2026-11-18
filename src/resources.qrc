@@ -21,6 +21,7 @@
         <file>FolioMenuItem.qml</file>
         <file>MenuLine.qml</file>
         <file>FolioScrollBar.qml</file>
+        <file>FileListView.qml</file>
         <file>PlainButton.qml</file>
         <file>PlainField.qml</file>
         <file>SortMenu.qml</file>
@@ -28,8 +29,11 @@
         <file>FolioDialog.qml</file>
         <file>ClashDialog.qml</file>
         <file>ConfirmDialog.qml</file>
+        <file>ChooserBar.qml</file>
         <file>FormatDialog.qml</file>
         <file>DriveMenu.qml</file>
+        <file>PlaceMenu.qml</file>
+        <file>Spinner.qml</file>
         <file>RenameDialog.qml</file>
         <file>MountPrompt.qml</file>
         <file>PreviewWindow.qml</file>

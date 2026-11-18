@@ -47,6 +47,16 @@ public:
     // costs no more than one of one.
     static bool anyTrashed(const QStringList &trashDirs);
 
+    // Home's folders can be left out of its section (Hide in the sidebar's
+    // menu) and put back (Show in Home in the folder's own menu, in home).
+    // Kept by name in ~/.config/folio/hidden-in-home, a JSON array.
+    Q_INVOKABLE void hideFromHome(const QString &path);
+    Q_INVOKABLE void showInHome(const QString &path);
+    Q_INVOKABLE bool hiddenFromHome(const QString &path) const;
+    // A folder renamed: its pin, or its place among those hidden from Home,
+    // follows it to its new name. Saving either failing says so (failed).
+    Q_INVOKABLE void renamed(const QString &from, const QString &to);
+
     // Lets go of the drive at `path`: ejects it when it can be (so a stick
     // or card is safe to pull out), otherwise unmounts it. Off the UI
     // thread, in GIO; `failed` says why when it can't.
@@ -90,6 +100,10 @@ private:
     void mountsRead();
     void refreshPinned();
     QString bookmarksPath() const;
+    QString configPath() const;
+    QString hiddenPath() const;
+    QStringList readHidden() const;
+    bool writeHidden(const QStringList &names);
     QStringList readBookmarkLines() const;
     bool writeBookmarkLines(const QStringList &lines);
     QString userDirectory(int location, const QString &fallback) const;
@@ -100,6 +114,8 @@ private:
     QString m_home;
     bool m_realHome;
     QVariantList m_places, m_pinned, m_views, m_devices;
+    // The names of home's folders left out of its section.
+    QStringList m_hidden;
     QTimer m_poll;
     // The trash changes from every window and from other apps (gio trash,
     // another file manager, rm), so it's watched rather than told. Trashing

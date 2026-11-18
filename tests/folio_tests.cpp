@@ -1,6 +1,12 @@
 #include <QClipboard>
+#include <QDBusConnection>
+#include <QDBusMetaType>
+#include <QDBusServer>
+#include <QDBusVariant>
 #include <QDir>
+#include <QEventLoopLocker>
 #include <QMimeData>
+#include <QMimeDatabase>
 #include <QPageSize>
 #include <QPainter>
 #include <QPdfWriter>
@@ -14,8 +20,12 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QProcess>
 #include <QQmlComponent>
+#include <QThread>
+#include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQmlPropertyMap>
@@ -29,12 +39,14 @@
 #include <QtConcurrent>
 #include <QtTest>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "backend.h"
+#include "chooser.h"
 #include "disks.h"
 #include "fileops.h"
 #include "foldermodel.h"
@@ -45,6 +57,7 @@
 #include "theme.h"
 #include "thumbnails.h"
 #include "translator.h"
+#include "windows.h"
 
 // Puts XDG_DATA_HOME, where the trash and recent files live, in `path` for
 // as long as the returned guard does.
@@ -425,6 +438,18 @@ static QString binWith(const QString &folder, const QHash<QString, QByteArray> &
     return folder;
 }
 
+// Runs the event loop as Folio's runs once its last window has closed: it
+// ends as soon as nothing holds the application, or fails after ten seconds.
+static int lastWindowClosed()
+{
+    QTimer::singleShot(0, qApp, [] { QEventLoopLocker lastWindow; });
+    QTimer failsafe;
+    failsafe.setSingleShot(true);
+    QObject::connect(&failsafe, &QTimer::timeout, qApp, [] { QCoreApplication::exit(1); });
+    failsafe.start(10000);
+    return QCoreApplication::exec();
+}
+
 // Puts PATH at `path` for as long as the returned guard does.
 [[nodiscard]] static auto pathAt(const QString &path)
 {
@@ -473,14 +498,382 @@ static Plugins::Run runBundled(const Plugins::Manifest &plugin, const QStringLis
     return Plugins::execute(plugin, command, env, 5000);
 }
 
+// Takes the options of a call, as the chooser does.
+class OptionsSink : public QObject {
+    Q_OBJECT
+
+public:
+    QList<QVariantMap> received;
+
+public slots:
+    void Take(const QVariantMap &options) { received << options; }
+};
+
+// Options as an app's call brings them to the chooser: sent over a D-Bus
+// connection of their own, so compound values arrive still marshalled.
+static QVariantMap overDBus(const QVariantMap &options)
+{
+    ChooserFilter::registerTypes();
+    qDBusRegisterMetaType<QByteArrayList>();
+    QDBusServer server;
+    OptionsSink sink;
+    QString peer;
+    QObject::connect(&server, &QDBusServer::newConnection, &sink, [&](const QDBusConnection &connection) {
+        QDBusConnection(connection).registerObject("/", &sink, QDBusConnection::ExportAllSlots);
+        peer = connection.name();
+    });
+    QDBusConnection app = QDBusConnection::connectToPeer(server.address(), "chooser-test-app");
+    if (!QTest::qWaitFor([&] { return !peer.isEmpty(); }))
+        return {};
+    QDBusMessage call = QDBusMessage::createMethodCall({}, "/", {}, "Take");
+    call << options;
+    app.send(call);
+    const bool arrived = QTest::qWaitFor([&] { return !sink.received.isEmpty(); });
+    QDBusConnection::disconnectFromPeer("chooser-test-app");
+    QDBusConnection::disconnectFromPeer(peer);
+    return arrived ? sink.received.value(0) : QVariantMap();
+}
+
+static ChooserRequest chooserRequest(ChooserRequest::Mode mode, const QVariantMap &options, QString *error)
+{
+    return ChooserRequest::read(mode, "Pick", overDBus(options), error);
+}
+
 class FolioTests : public QObject {
     Q_OBJECT
+    // Where the tests' folders keep their orders, away from the real ones.
+    QTemporaryDir settings;
 
 private slots:
     void initTestCase()
     {
         // No test ever reaches the real udisks, which would change real disks.
         fakeDisks({});
+        Backend::setSettingsFile(settings.filePath("folio.conf"));
+    }
+
+    void foldersRememberTheirOrderAndPassItDown()
+    {
+        QTemporaryDir home;
+        for (const char *dir : {"Downloads/monkey/deep", "Downloads/zebra", "Music"})
+            QDir(home.path()).mkpath(dir);
+        const QString downloads = home.filePath("Downloads"), monkey = home.filePath("Downloads/monkey");
+        Backend backend(home.path());
+        backend.navigate(downloads);
+        QCOMPARE(backend.folder()->sortMode(), QString("name"));
+        backend.chooseSort("modified");
+
+        // The folders inside take it, however deep; the ones beside don't.
+        backend.navigate(monkey);
+        QCOMPARE(backend.folder()->sortMode(), QString("modified"));
+        backend.navigate(monkey + "/deep");
+        QCOMPARE(backend.folder()->sortMode(), QString("modified"));
+        backend.navigate(home.filePath("Music"));
+        QCOMPARE(backend.folder()->sortMode(), QString("name"));
+        backend.navigate(home.path());
+        QCOMPARE(backend.folder()->sortMode(), QString("name"));
+
+        // A folder inside can have its own, which its parent's doesn't undo.
+        backend.navigate(monkey);
+        backend.chooseSort("size");
+        backend.navigate(downloads);
+        QCOMPARE(backend.folder()->sortMode(), QString("modified"));
+        backend.chooseSort("kind");
+        backend.navigate(home.filePath("Downloads/zebra"));
+        QCOMPARE(backend.folder()->sortMode(), QString("kind"));
+        backend.back();
+        backend.back();
+        QCOMPARE(backend.path(), monkey);
+        QCOMPARE(backend.folder()->sortMode(), QString("size"));
+        QCOMPARE(Backend::sortFor(monkey + "/deep"), QString("size"));
+
+        // Kept for the next launch, and for every window: another pane
+        // arrives in the same orders.
+        Backend other(home.path());
+        other.navigate(monkey + "/deep");
+        QCOMPARE(other.folder()->sortMode(), QString("size"));
+
+        // Put back in its parent's order, a folder follows the parent again.
+        backend.chooseSort("kind");
+        backend.navigate(downloads);
+        backend.chooseSort("oldest");
+        QCOMPARE(Backend::sortFor(monkey), QString("oldest"));
+
+        // Choosing the order a folder already has, now its parent's too,
+        // frees it to follow the parent.
+        backend.navigate(monkey);
+        backend.chooseSort("size");
+        backend.navigate(downloads);
+        backend.chooseSort("size");
+        backend.navigate(monkey);
+        backend.chooseSort("size");
+        backend.navigate(downloads);
+        backend.chooseSort("name");
+        QCOMPARE(Backend::sortFor(monkey), QString("name"));
+    }
+
+    void columnsShowEachFolderInItsOwnOrder()
+    {
+        QTemporaryDir home;
+        QDir(home.path()).mkpath("Downloads/monkey/deep");
+        const QString downloads = home.filePath("Downloads"), monkey = home.filePath("Downloads/monkey");
+        Backend backend(home.path());
+        backend.navigate(downloads);
+        backend.chooseSort("modified");
+        backend.navigate(monkey + "/deep");
+        backend.chooseSort("size");
+        backend.goUp();
+        Theme theme(home.filePath("theme"));
+        FileOps fileOps;
+        Translator translator(home.filePath("language"), home.path());
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("plugins", QVariantMap{{"views", QVariantMap{}}});
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        QQmlComponent component(&engine);
+        component.setData(R"(
+            import QtQuick
+            Window {
+                width: 900; height: 480; visible: true
+                property alias cursor: folderView.currentIndex
+                FolderColumns { id: folderView; anchors.fill: parent; Component.onCompleted: focusView() }
+            }
+        )", QUrl::fromLocalFile(sourceFolder() + "/ColumnsSortTest.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        // The orders of the folders the columns show, the one shown too.
+        const auto orders = [&] {
+            QStringList found;
+            std::function<void(QQuickItem *)> walk = [&](QQuickItem *item) {
+                auto *model = qobject_cast<FolderModel *>(item->property("model").value<QObject *>());
+                if (model && !model->path().isEmpty())
+                    found << QFileInfo(model->path()).fileName() + ":" + model->sortMode();
+                for (auto *child : item->childItems())
+                    walk(child);
+            };
+            walk(qobject_cast<QQuickWindow *>(root.get())->contentItem());
+            found.removeDuplicates();
+            found.sort();
+            return found;
+        };
+        // The cursor on deep, its contents beside it in deep's order; the
+        // folders above in their own.
+        QTRY_COMPARE(backend.folder()->rowCount(), 1);
+        root->setProperty("cursor", 0);
+        QTRY_VERIFY2(orders().contains("deep:size"), qPrintable(orders().join(" ")));
+        QVERIFY(orders().contains("Downloads:modified"));
+        QVERIFY(orders().contains(QFileInfo(home.path()).fileName() + ":name"));
+        // A choice in the folder shown reaches the columns as it's made:
+        // deep keeps its own, home its own.
+        backend.chooseSort("oldest");
+        QStringList expected({"Downloads:modified", QFileInfo(home.path()).fileName() + ":name", "deep:size", "monkey:oldest"});
+        expected.sort();
+        QTRY_COMPARE(orders(), expected);
+    }
+
+    // A place picked in the sidebar is the first column shown, with the
+    // folders above it scrolled out of sight to the left; going up shows
+    // them again.
+    void columnsStartAtAPlacePicked()
+    {
+        QTemporaryDir home;
+        QDir(home.path()).mkpath("Dropbox/Audio");
+        QDir(home.path()).mkpath("Work");
+        const QString dropbox = home.filePath("Dropbox");
+        Backend backend(home.path());
+        backend.navigate(home.filePath("Work"));
+        Theme theme(home.filePath("theme"));
+        FileOps fileOps;
+        Translator translator(home.filePath("language"), home.path());
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("plugins", QVariantMap{{"views", QVariantMap{}}});
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        QQmlComponent component(&engine);
+        component.setData(R"(
+            import QtQuick
+            Window {
+                width: 1200; height: 480; visible: true
+                FolderColumns { id: folderView; anchors.fill: parent; Component.onCompleted: focusView() }
+                function startAt(path) { folderView.startAt(path) }
+                function scrolled() {
+                    const flick = folderView.children[folderView.children.length - 1]
+                    return flick.contentX
+                }
+            }
+        )", QUrl::fromLocalFile(sourceFolder() + "/ColumnsStartTest.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        const auto scrolled = [&] {
+            QVariant x;
+            QMetaObject::invokeMethod(root.get(), "scrolled", Q_RETURN_ARG(QVariant, x));
+            return x.toReal();
+        };
+        // Wide enough for home, Work and more: nothing's scrolled.
+        QTRY_COMPARE(backend.path(), home.filePath("Work"));
+        QCOMPARE(scrolled(), 0.0);
+        // Dropbox from the sidebar: home's column is out of sight.
+        QMetaObject::invokeMethod(root.get(), "startAt", Q_ARG(QVariant, dropbox));
+        backend.navigate(dropbox);
+        QTRY_COMPARE(scrolled(), 261.0);
+        // Deeper, it stays out of sight.
+        backend.navigate(dropbox + "/Audio");
+        QTRY_COMPARE(scrolled(), 261.0);
+        // Back up to Dropbox and then home, it's shown again.
+        backend.goUp();
+        QTRY_COMPARE(scrolled(), 261.0);
+        backend.goUp();
+        QTRY_COMPARE(scrolled(), 0.0);
+        // Picking where it already is starts there too.
+        backend.navigate(dropbox);
+        QTRY_COMPARE(scrolled(), 0.0);
+        QMetaObject::invokeMethod(root.get(), "startAt", Q_ARG(QVariant, dropbox));
+        QTRY_COMPARE(scrolled(), 261.0);
+    }
+
+    // A click on a folder in the last column, the one showing what's inside
+    // the selected folder, goes there: the folder it's in is shown, with it
+    // selected and its own contents beside it.
+    void columnsClickIntoTheLastColumn()
+    {
+        QTemporaryDir home;
+        QDir(home.path()).mkpath("Documents/Racing/2025/Le Mans");
+        Backend backend(home.path());
+        backend.navigate(home.filePath("Documents"));
+        Theme theme(home.filePath("theme"));
+        FileOps fileOps;
+        Translator translator(home.filePath("language"), home.path());
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("plugins", QVariantMap{{"views", QVariantMap{}}});
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        QQmlComponent component(&engine);
+        component.setData(R"(
+            import QtQuick
+            Window {
+                width: 1200; height: 480; visible: true
+                property alias cursor: folderView.currentIndex
+                readonly property string selected: folderView.selected.name || ""
+                FolderColumns { id: folderView; anchors.fill: parent; Component.onCompleted: focusView() }
+            }
+        )", QUrl::fromLocalFile(sourceFolder() + "/ColumnsClickTest.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        auto *window = qobject_cast<QQuickWindow *>(root.get());
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QTRY_COMPARE(backend.folder()->rowCount(), 1);
+        root->setProperty("cursor", 0);
+        QTRY_COMPARE(root->property("selected").toString(), QString("Racing"));
+        // home's column, Documents', then Racing's contents: 2025.
+        QTest::qWait(300);
+        QTest::mouseClick(window, Qt::LeftButton, {}, QPoint(2 * 261 + 80, 20));
+        QTRY_COMPARE(backend.path(), home.filePath("Documents/Racing"));
+        QTRY_COMPARE(root->property("selected").toString(), QString("2025"));
+    }
+
+    // The list's tree: a folder opened in place lists its items under it a
+    // level in, read again with the folder when anything changes; closed,
+    // they go, with anything opened or selected inside.
+    void folderOpensFoldersInPlace()
+    {
+        QTemporaryDir dir;
+        QDir(dir.path()).mkpath("alpha/inner");
+        QDir(dir.path()).mkpath("beta");
+        write(dir.filePath("alpha/x.txt"), "x");
+        write(dir.filePath("alpha/inner/deep.txt"), "x");
+        write(dir.filePath("top.txt"), "x");
+        FolderModel model;
+        QSignalSpy loaded(&model, &FolderModel::loaded);
+        model.setPath(dir.path());
+        QVERIFY(loaded.wait(3000));
+        const auto names = [&] {
+            QStringList list;
+            for (int row = 0; row < model.count(); ++row)
+                list << QString(model.get(row).value("depth").toInt() * 2, ' ') + model.get(row).value("name").toString();
+            return list;
+        };
+        QCOMPARE(names(), QStringList({"alpha", "beta", "top.txt"}));
+        QVERIFY(model.expandable());
+
+        model.setExpanded(0, true);
+        QVERIFY(model.isExpanded(0));
+        QTRY_COMPARE(names(), QStringList({"alpha", "  inner", "  x.txt", "beta", "top.txt"}));
+        QCOMPARE(model.parentRow(2), 0);
+        QCOMPARE(model.parentRow(3), -1);
+        // Only the folder's own items go by their names.
+        QCOMPARE(model.indexOf("x.txt"), -1);
+        QCOMPARE(model.indexOfPath(dir.filePath("alpha/x.txt")), 2);
+
+        // A level deeper still.
+        model.setExpanded(1, true);
+        QTRY_COMPARE(names(), QStringList({"alpha", "  inner", "    deep.txt", "  x.txt", "beta", "top.txt"}));
+
+        // A file added inside shows, the folder read again with it.
+        write(dir.filePath("alpha/y.txt"), "y");
+        QTRY_COMPARE_WITH_TIMEOUT(names(), QStringList({"alpha", "  inner", "    deep.txt", "  x.txt", "  y.txt", "beta", "top.txt"}), 3000);
+
+        // Closed, what's inside goes, the folder opened within it and what
+        // was selected there too.
+        model.selectRows({2, 4});
+        QCOMPARE(model.selectedCount(), 2);
+        model.setExpanded(0, false);
+        QCOMPARE(names(), QStringList({"alpha", "beta", "top.txt"}));
+        QCOMPARE(model.selectedCount(), 0);
+        model.setExpanded(0, true);
+        QTRY_COMPARE(names(), QStringList({"alpha", "  inner", "  x.txt", "  y.txt", "beta", "top.txt"}));
+
+        // Closed and opened again before its first reading is in, it lists
+        // its items once, not once for each opening.
+        model.setExpanded(0, false);
+        model.setExpanded(0, true);
+        model.setExpanded(0, false);
+        model.setExpanded(0, true);
+        QTRY_COMPARE(names(), QStringList({"alpha", "  inner", "  x.txt", "  y.txt", "beta", "top.txt"}));
+        QTest::qWait(200);
+        QCOMPARE(names(), QStringList({"alpha", "  inner", "  x.txt", "  y.txt", "beta", "top.txt"}));
+
+        // One that can't be read closes again, saying why, rather than
+        // looking empty.
+        QSignalSpy failed(&model, &FolderModel::expandFailed);
+        QVERIFY(QFile::setPermissions(dir.filePath("beta"), QFileDevice::Permissions()));
+        model.setExpanded(4, true);
+        QTRY_COMPARE(failed.count(), 1);
+        QVERIFY(failed.last().first().toString().startsWith("beta: "));
+        QVERIFY(!model.isExpanded(4));
+        QCOMPARE(names(), QStringList({"alpha", "  inner", "  x.txt", "  y.txt", "beta", "top.txt"}));
+        QVERIFY(QFile::setPermissions(dir.filePath("beta"), QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        // Files and the folder's other views don't open.
+        model.setExpanded(5, true);
+        QVERIFY(!model.isExpanded(5));
+        model.collapseAll();
+        QCOMPARE(names(), QStringList({"alpha", "beta", "top.txt"}));
+
+        // A search is a flat list, and nothing opens in it.
+        model.setExpanded(0, true);
+        QTRY_COMPARE(model.count(), 6);
+        model.setQuery("x");
+        QVERIFY(!model.expandable());
+        QVERIFY(loaded.wait(3000));
+        QVERIFY(!names().join(",").contains("  "));
+        model.setQuery({});
+        QVERIFY(loaded.wait(3000));
+        QCOMPARE(names(), QStringList({"alpha", "beta", "top.txt"}));
     }
 
     void folderListsDirectoriesFirstWithoutHidden()
@@ -546,6 +939,9 @@ private slots:
         // The folder counts just count, the hidden only when they show.
         QCOMPARE(FolderModel::itemCount(dir.path(), false), 4);
         QCOMPARE(FolderModel::itemCount(dir.path(), true), 5);
+        // Stopped partway through, a count is unknown rather than partial.
+        int checks = 0;
+        QCOMPARE(FolderModel::itemCount(dir.path(), false, [&] { return ++checks > 1; }), -1);
     }
 
     void folderModelLoadsInTheBackground()
@@ -603,6 +999,78 @@ private slots:
         QVERIFY(model.query().isEmpty());
     }
 
+    // A search tells what it finds as it goes, rather than all at the end:
+    // a big tree could keep the window showing nothing for a long while.
+    void folderSearchShowsMatchesAsTheyreFound()
+    {
+        QTemporaryDir dir;
+        for (int i = 0; i < 40; ++i) {
+            const QString folder = QString("d%1").arg(i, 2, 10, QLatin1Char('0'));
+            QDir(dir.path()).mkpath(folder);
+            write(dir.filePath(folder + "/match-" + folder + ".txt"), "x");
+            write(dir.filePath(folder + "/other.txt"), "x");
+        }
+        // A slow walk (each look at the stop check takes a while), so the
+        // matches come in several batches before it's done.
+        QStringList told;
+        int batches = 0;
+        const auto found = FolderModel::search(dir.path(), "match", false, "name",
+            [] { QThread::usleep(2000); return false; }, 1000, QLocale(), {},
+            [&](const QVector<FolderModel::Entry> &batch) {
+                ++batches;
+                for (const auto &e : batch)
+                    told << e.name;
+            });
+        QVERIFY2(batches > 1, qPrintable(QString::number(batches)));
+        QStringList all;
+        for (const auto &e : found)
+            all << e.name;
+        QCOMPARE(all.size(), 40);
+        told.sort();
+        QCOMPARE(told, all);
+
+        // The model shows a new search from empty, at once, not the folder it
+        // searches; and ends with its matches in the folder's order.
+        FolderModel model;
+        QSignalSpy loaded(&model, &FolderModel::loaded);
+        model.setPath(dir.path());
+        QVERIFY(loaded.wait(3000));
+        QCOMPARE(model.count(), 40);
+        model.setQuery("match");
+        QCOMPARE(model.count(), 0);
+        QVERIFY(model.loading());
+        QTRY_VERIFY(!model.loading());
+        QCOMPARE(model.count(), 40);
+        for (int row = 0; row < 40; ++row)
+            QCOMPARE(model.get(row).value("name").toString(), all.at(row));
+        // The same search again (the folder changed) keeps its matches up,
+        // and what was selected and is gone is no longer selected.
+        model.selectRows({0, 1});
+        QVERIFY(QFile::remove(dir.filePath("d00/match-d00.txt")));
+        model.reload();
+        QCOMPARE(model.count(), 40);
+        QTRY_VERIFY(!model.loading());
+        QCOMPARE(model.count(), 39);
+        QCOMPARE(model.selectedCount(), 1);
+        QCOMPARE(model.selectedPaths(), QStringList({dir.filePath("d01/match-d01.txt")}));
+
+        // A match found early is told before the walk ends, though nothing
+        // else matches after it.
+        QTemporaryDir quiet;
+        write(quiet.filePath("early-match.txt"), "x");
+        for (int i = 0; i < 30; ++i) {
+            QDir(quiet.path()).mkpath(QString("f%1").arg(i));
+            for (int j = 0; j < 5; ++j)
+                write(quiet.filePath(QString("f%1/file-%2.txt").arg(i).arg(j)), "x");
+        }
+        int looks = 0, lookedWhenTold = -1;
+        FolderModel::search(quiet.path(), "match", false, "name",
+            [&] { ++looks; QThread::usleep(2000); return false; }, 1000, QLocale(), {},
+            [&](const QVector<FolderModel::Entry> &) { if (lookedWhenTold < 0) lookedWhenTold = looks; });
+        QVERIFY2(lookedWhenTold > 0 && lookedWhenTold < looks / 2,
+                 qPrintable(QString("told at %1 of %2").arg(lookedWhenTold).arg(looks)));
+    }
+
     void folderSearchSkipsSymlinkedFolders()
     {
         // A link back up the tree would otherwise be walked round and round.
@@ -613,6 +1081,80 @@ private slots:
         const auto found = FolderModel::search(dir.path(), "match", false, "name");
         QCOMPARE(found.size(), 1);
         QCOMPARE(found.first().name, QString("real/match.txt"));
+    }
+
+    void searchStartsOnItsFirstResult()
+    {
+        // A search lists its matches on the folder's own path, so it kept the
+        // cursor's row as a re-read does, instead of starting on its first (#96).
+        QTemporaryDir home, plugins;
+        QVERIFY(QDir(home.path()).mkdir("files"));
+        for (int i = 0; i < 12; ++i)
+            write(home.filePath(QString("files/file-%1.txt").arg(i, 2, 10, QLatin1Char('0'))), "x");
+        Backend backend(home.path());
+        Theme theme(home.filePath("theme"));
+        Places places(home.path());
+        FileOps fileOps;
+        Plugins bundled("en", {plugins.path()}, home.filePath("folio.conf"));
+        Translator translator(home.filePath("language"), home.path());
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        QQmlEngine engine;
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("chooser", static_cast<QObject *>(nullptr));
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("plugins", &bundled);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("places", &places);
+        QQmlComponent component(&engine);
+        component.setData(R"(
+            import QtQuick
+            import QtQuick.Controls
+            ApplicationWindow {
+                width: 900; height: 620; visible: true
+                property string viewMode: "columns"
+                property real zoom: 1
+                property bool split: false
+                property bool helpVisible: false
+                property var activePane: null
+                function raise() {}
+                function requestActivate() {}
+                FolderPane { id: pane; anchors.fill: parent; focus: true }
+                Component.onCompleted: activePane = pane
+                readonly property var paneItem: pane
+            }
+        )", QUrl::fromLocalFile(sourceFolder() + "/SearchFirstResultTest.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        auto *window = qobject_cast<QQuickWindow *>(root.get());
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+        auto *pane = root->property("paneItem").value<QObject *>();
+        QVERIFY(pane);
+        QVERIFY(QMetaObject::invokeMethod(pane, "focusView"));
+
+        // Let the pane record the unfiltered folder before searching it.
+        backend.navigate(home.filePath("files"));
+        QTRY_COMPARE(backend.folder()->count(), 12);
+        const auto cursor = [&] { return pane->property("current").toMap().value("path").toString(); };
+        QTRY_COMPARE(cursor(), home.filePath("files/file-00.txt"));
+        for (int i = 0; i < 5; ++i)
+            QTest::keyClick(window, Qt::Key_Down);
+        QTRY_COMPARE(cursor(), home.filePath("files/file-05.txt"));
+
+        // Two matches, the first of them file-10: a new query starts on its
+        // first result, not on the row the cursor had.
+        backend.folder()->setQuery("file-1");
+        QTRY_COMPARE(backend.folder()->count(), 2);
+        QTRY_COMPARE(cursor(), home.filePath("files/file-10.txt"));
+
+        // Ending it keeps the cursor on what it found.
+        backend.folder()->setQuery(QString());
+        QTRY_VERIFY(!backend.folder()->loading());
+        QTRY_COMPARE(cursor(), home.filePath("files/file-10.txt"));
     }
 
     void folderModelSwapsFoldersWithoutAnEmptyFrame()
@@ -684,11 +1226,8 @@ private slots:
 
     void folderModelStopsReadingWhatsBeenOvertaken()
     {
-        // A big folder left before it's been read, or a search of it, stops
-        // being read instead of holding on to a thread of the pool that the
-        // next listing, the folder counts and file transfers all wait for.
-        // With a pool of one thread, the next folder waits for the overtaken
-        // read to stop, so it shows in a fraction of the time the read takes.
+        // With one listing thread, the next folder shows in a fraction of the
+        // time a big read takes only if the overtaken read stops.
         QTemporaryDir big, small, other;
         for (int i = 0; i < 20000; ++i)
             write(big.filePath(QString("%1.txt").arg(i)), "x");
@@ -701,7 +1240,7 @@ private slots:
         FolderModel::search(big.path(), "none", false, "name");
         const qint64 searching = timer.elapsed();
 
-        QThreadPool *pool = QThreadPool::globalInstance();
+        QThreadPool *pool = &FolderModel::listingPool();
         pool->waitForDone();
         const int threads = pool->maxThreadCount();
         pool->setMaxThreadCount(1);
@@ -746,6 +1285,61 @@ private slots:
         QCOMPARE(model.get(0).value("path").toString(), b.filePath("report.txt"));
     }
 
+    void fileOpsKnowsTheEditorOmarchyOpens()
+    {
+        // The editor picked under Setup > Default > Editor, read the way
+        // omarchy-launch-editor reads it: Neovim when none was picked, or
+        // when the picked one isn't installed.
+        QTemporaryDir home, bin;
+        const QByteArray oldHome = qgetenv("HOME"), oldPath = qgetenv("PATH");
+        const auto restore = qScopeGuard([&] {
+            qputenv("HOME", oldHome);
+            qputenv("PATH", oldPath);
+        });
+        qputenv("HOME", QFile::encodeName(home.path()));
+        qputenv("PATH", QFile::encodeName(bin.path()));
+        for (const char *name : {"code", "subl"}) {
+            write(bin.filePath(name), "#!/bin/sh\n");
+            QVERIFY(QFile::setPermissions(bin.filePath(name), QFile::ReadOwner | QFile::ExeOwner));
+        }
+        QCOMPARE(FileOps::omarchyEditor(), QString("nvim"));
+        const QString setting = home.filePath(".local/state/omarchy/defaults/editor");
+        QVERIFY(QDir().mkpath(QFileInfo(setting).path()));
+        write(setting, "code\n");
+        QCOMPARE(FileOps::omarchyEditor(), QString("code"));
+        write(setting, "sublime_text\n");
+        QCOMPARE(FileOps::omarchyEditor(), QString("subl"));
+        write(setting, "zeditor\n");
+        QCOMPARE(FileOps::omarchyEditor(), QString("nvim"));
+
+        // The handler is named after the app that runs the picked editor,
+        // by its executable's name wherever it lives; with none, nothing,
+        // and it keeps its own name.
+        const QVariantList apps{QVariantMap{{"executable", "/usr/bin/code"}, {"name", "Visual Studio Code"}},
+                                QVariantMap{{"executable", "nvim"}, {"name", "Neovim"}}};
+        write(setting, "code\n");
+        QCOMPARE(FileOps::editorAppName(apps), QString("Visual Studio Code"));
+        write(setting, "zeditor\n");
+        QCOMPARE(FileOps::editorAppName(apps), QString("Neovim"));
+        write(setting, "subl\n");
+        QCOMPARE(FileOps::editorAppName({apps.first()}), QString());
+    }
+
+    void fileOpsListsTheEditorHandlerOnce()
+    {
+        // Named after Neovim, the handler and Neovim's own entry would be two
+        // of one name: the handler, the default that follows the picked
+        // editor, stands for both. Apps that share a name otherwise stay.
+        const QVariantMap handler{{"id", "omarchy-launch-editor.desktop"}, {"name", "Neovim"}, {"isDefault", true}};
+        const QVariantMap writer{{"id", "libreoffice-writer.desktop"}, {"name", "LibreOffice Writer"}, {"isDefault", false}};
+        const QVariantMap neovim{{"id", "nvim.desktop"}, {"name", "Neovim"}, {"isDefault", false}};
+        QCOMPARE(FileOps::foldHandlerRepeats({handler, writer, neovim}), QVariantList({handler, writer}));
+        QVariantMap other = neovim;
+        other["isDefault"] = true;
+        const QVariantMap twin{{"id", "nvim-qt.desktop"}, {"name", "Neovim"}, {"isDefault", false}};
+        QCOMPARE(FileOps::foldHandlerRepeats({other, writer, twin}), QVariantList({other, writer, twin}));
+    }
+
     void fileOpsDeleteForeverOutsideTheTrash()
     {
         // Shift+Delete deletes for good anywhere: the folder and what's in
@@ -766,6 +1360,61 @@ private slots:
         QVERIFY(!QFileInfo(dir.filePath("link")).isSymLink());
         QVERIFY(QFile::exists(dir.filePath("kept.txt")));
         QVERIFY(!QFileInfo::exists(data.filePath("Trash/files/album")));
+    }
+
+    void fileOpsKnowsTheTrashFromThePath()
+    {
+        // The home trash's files and below, and a drive's own .Trash-<uid> or
+        // .Trash/<uid> at its top, not a folder by that name lower down.
+        QTemporaryDir data;
+        const auto restore = dataHomeAt(data.path());
+        const QString home = data.filePath("Trash");
+        FileOps ops;
+        QVERIFY(ops.inTrash(home + "/files"));
+        QVERIFY(ops.inTrash(home + "/files/album"));
+        QVERIFY(!ops.inTrash(home));
+        QVERIFY(!ops.inTrash(home + "/info"));
+        QCOMPARE(FileOps::infoFileFor(home + "/files/album"), home + "/info/album.trashinfo");
+        QCOMPARE(FileOps::infoFileFor(home + "/files/album/a.jpg"), QString());
+
+        const QString uid = QString::number(getuid());
+        QVERIFY(ops.inTrash("/.Trash/" + uid + "/files"));
+        QCOMPARE(FileOps::infoFileFor("/.Trash-" + uid + "/files/x"), "/.Trash-" + uid + "/info/x.trashinfo");
+        QVERIFY(!ops.inTrash("/.Trash-" + uid + "/files-old/x"));
+        QVERIFY(!ops.inTrash(data.filePath(".Trash-" + uid + "/files/x")));
+    }
+
+    void fileOpsKnowsTheTrashUnderADataHomeAsWritten()
+    {
+        // ~/.local/share/ is the same folder, and link/../data is where link
+        // leads, not the folder beside link that cleaning the path names.
+        QTemporaryDir data;
+        const QString trash = data.filePath("real/data/Trash");
+        QVERIFY(QDir().mkpath(trash + "/info") && QDir().mkpath(data.filePath("real/child")));
+        QVERIFY(QFile::link(data.filePath("real/child"), data.filePath("link")));
+        write(trash + "/info/a.txt.trashinfo", "[Trash Info]\nPath=/a.txt\n");
+        FileOps ops;
+        for (const QString &home : {data.filePath("real/data") + '/', data.filePath("link/../data")}) {
+            const auto restore = dataHomeAt(home);
+            QVERIFY(ops.inTrash(trash + "/files"));
+            QCOMPARE(FileOps::originalPath(trash + "/files/a.txt"), QString("/a.txt"));
+        }
+    }
+
+    void fileOpsRestoresFromTheRootDrivesTrashToTheTop()
+    {
+        // A drive's own trash notes paths from the top of the drive; for /
+        // that top is /, not the folder Folio was started in. Needs a
+        // throwaway / (bwrap --tmpfs /, or a CI container), and never
+        // touches a /.Trash that's already there.
+        const QString uid = QString::number(getuid());
+        const QString dir = "/.Trash/" + uid;
+        if (!QFileInfo(QStringLiteral("/")).isWritable() || QFileInfo::exists(QStringLiteral("/.Trash")))
+            QSKIP("needs a writable / without a .Trash");
+        QVERIFY(QDir().mkpath(dir + "/info"));
+        const auto gone = qScopeGuard([] { QDir(QStringLiteral("/.Trash")).removeRecursively(); });
+        write(dir + "/info/a.txt.trashinfo", "[Trash Info]\nPath=docs/a.txt\n");
+        QCOMPARE(FileOps::originalPath(dir + "/files/a.txt"), QString("/docs/a.txt"));
     }
 
     void folderPaneKeysAreNotBoundTwice()
@@ -1340,7 +1989,7 @@ private slots:
         const QList<QUrl> install{QUrl::fromLocalFile(home.filePath("project/install"))};
         FileOps ops;
         QSignalSpy done(&ops, &FileOps::done);
-        for (const QString &folder : {"project/install", "project", "shortcut"}) {
+        for (const QString folder : {"project/install", "project", "shortcut"}) {
             QVERIFY2(!ops.canDrop(install, home.filePath(folder)), qPrintable(folder));
             ops.dropInto(install, home.filePath(folder));
         }
@@ -1361,12 +2010,12 @@ private slots:
         QTemporaryDir home;
         QDir(home.path()).mkpath("project/install");
         FileOps ops;
-        QQmlPropertyMap theme;
-        theme.insert("accent", QColor(Qt::blue));
-        theme.insert("radius", 0);
+        const std::unique_ptr<QQmlPropertyMap> theme(QQmlPropertyMap::create());
+        theme->insert("accent", QColor(Qt::blue));
+        theme->insert("radius", 0);
         QQmlEngine engine;
         engine.rootContext()->setContextProperty("fileOps", &ops);
-        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("theme", theme.get());
         engine.rootContext()->setContextProperty("home", home.path());
         QQmlComponent component(&engine);
         component.setData("import QtQuick\n"
@@ -1391,7 +2040,7 @@ private slots:
         QMimeData data;
         data.setUrls({QUrl::fromLocalFile(home.filePath("project/install"))});
         const auto dropAt = [&](QPointF at) {
-            QDragEnterEvent enter(at.toPoint(), Qt::MoveAction, &data, Qt::LeftButton, Qt::NoModifier);
+            QDragEnterEvent enter(at, Qt::MoveAction, &data, Qt::LeftButton, Qt::NoModifier);
             QGuiApplication::sendEvent(window, &enter);
             QDropEvent drop(at, Qt::MoveAction, &data, Qt::LeftButton, Qt::NoModifier);
             QGuiApplication::sendEvent(window, &drop);
@@ -1492,6 +2141,30 @@ private slots:
         // Left before it's done, it stops checking what's on the list.
         int checks = 0;
         QVERIFY(FolderModel::listRecent(dir.filePath("recently-used.xbel"), false, 200, [&] { return ++checks > 3; }).size() == 1);
+    }
+
+    void trashListsEveryDrivesTrash()
+    {
+        // Another drive's trash is listed and searched with the home one's,
+        // sorted together; a drive without one is passed over.
+        QTemporaryDir home, other;
+        QDir().mkpath(home.filePath("files"));
+        QDir().mkpath(other.filePath("files"));
+        write(home.filePath("files/b.txt"), "x");
+        write(other.filePath("files/a.txt"), "x");
+        const QStringList dirs{home.path(), other.path(), other.filePath("none")};
+        const auto entries = FolderModel::listTrash(dirs, {}, false, "name");
+        QCOMPARE(entries.size(), 2);
+        QCOMPARE(entries.at(0).path, other.filePath("files/a.txt"));
+        QCOMPARE(entries.at(1).path, home.filePath("files/b.txt"));
+        const auto found = FolderModel::listTrash(dirs, "a", false, "name");
+        QCOMPARE(found.size(), 1);
+        QCOMPARE(found.at(0).path, other.filePath("files/a.txt"));
+        // A search's limit is for every trash together, and a listing left
+        // once the first trash is read reads no other.
+        QCOMPARE(FolderModel::listTrash(dirs, "txt", false, "name", {}, 1).size(), 1);
+        int checks = 0;
+        QVERIFY(FolderModel::listTrash(dirs, {}, false, "name", [&] { return ++checks > 2; }).isEmpty());
     }
 
     void folderSortsFiveWays()
@@ -1785,6 +2458,164 @@ private slots:
         QVERIFY(!QFileInfo::exists(again.filePath("pipe")));
     }
 
+    void fileOpsKeepFolioRunningUntilDone()
+    {
+        // Closing the last window mid-copy leaves Folio running until the
+        // copy is done, rather than quitting under it. The copy reads a pipe,
+        // so it's under way until the test closes the pipe's writer.
+        QTemporaryDir from, to;
+        const QByteArray pipe = QFile::encodeName(from.filePath("pipe"));
+        QVERIFY(mkfifo(pipe.constData(), 0600) == 0);
+        FileOps ops;
+        ops.copy({from.filePath("pipe")});
+        ops.paste(to.path());
+        QVERIFY(!ops.busy().isEmpty());
+        int writer = -1;
+        const auto finish = qScopeGuard([&] {
+            if (writer >= 0)
+                close(writer);
+            QTRY_VERIFY(ops.busy().isEmpty());
+        });
+        QVERIFY(QTest::qWaitFor([&] { return (writer = open(pipe.constData(), O_WRONLY | O_NONBLOCK)) >= 0; }));
+
+        QObject scope;
+        QTimer::singleShot(300, &scope, [&] { close(std::exchange(writer, -1)); });
+        QCOMPARE(lastWindowClosed(), 0);
+        QVERIFY(ops.busy().isEmpty());
+        QVERIFY(QFileInfo::exists(to.filePath("pipe")));
+    }
+
+    void fileOpsKeepFolioRunningUntilAHelperIsDone()
+    {
+        // Compressing runs bsdtar, which a closed last window waits for too,
+        // and one that can't start doesn't keep Folio running.
+        if (QStandardPaths::findExecutable("bsdtar").isEmpty())
+            QSKIP("Compressing needs bsdtar.");
+        QTemporaryDir dir;
+        write(dir.filePath("x.txt"), "x");
+        FileOps ops;
+        ops.compress({dir.filePath("x.txt")});
+        QVERIFY(!ops.busy().isEmpty());
+        QCOMPARE(lastWindowClosed(), 0);
+        QVERIFY(ops.busy().isEmpty());
+        QVERIFY(QFileInfo::exists(dir.filePath("x.txt.zip")));
+
+        QTemporaryDir empty;
+        const auto path = pathAt(empty.path());
+        ops.compress({dir.filePath("x.txt")});
+        QCOMPARE(lastWindowClosed(), 0);
+        QVERIFY(ops.busy().isEmpty());
+    }
+
+    void fileOpsCancelStopsACopyWaitingOnItsSource()
+    {
+        // Stop ends a copy waiting on a pipe nobody writes to, or on a file another program holds a lease on, and a signal meanwhile doesn't end the wait.
+        QTemporaryDir from, to;
+        const QByteArray pipe = QFile::encodeName(from.filePath("pipe"));
+        QVERIFY(mkfifo(pipe.constData(), 0600) == 0);
+        write(from.filePath("leased"), "kept");
+        const int holder = open(QFile::encodeName(from.filePath("leased")).constData(), O_RDWR);
+        QVERIFY(holder >= 0);
+        // Breaking a lease tells its holder with SIGIO, which would end the test.
+        const auto io = signal(SIGIO, SIG_IGN), usr1 = signal(SIGUSR1, [](int) {});
+        const auto restored = qScopeGuard([&] {
+            close(holder);
+            signal(SIGIO, io);
+            signal(SIGUSR1, usr1);
+        });
+        for (const QString name : {"pipe", "leased"}) {
+            if (name == "leased" && fcntl(holder, F_SETLEASE, F_WRLCK) != 0)
+                QSKIP("This filesystem gives no leases.");
+            FileOps::Job job;
+            QString error;
+            std::atomic<pthread_t> copier{};
+            QFuture<bool> copied = QtConcurrent::run([&] {
+                copier = pthread_self();
+                return FileOps::copyRecursively(from.filePath(name), to.filePath(name), &error, false, &job);
+            });
+            // A copy Stop didn't reach ends once its source is let go, so a run that fails ends too.
+            const auto finish = qScopeGuard([&] {
+                job.cancelled = true;
+                fcntl(holder, F_SETLEASE, F_UNLCK);
+                if (const int writer = open(pipe.constData(), O_WRONLY | O_NONBLOCK); writer >= 0)
+                    close(writer);
+                copied.waitForFinished();
+            });
+            QTRY_VERIFY(copier != pthread_t{});
+            // Longer than a few of the copy's looks for Stop, 100 ms apart.
+            QTest::qWait(300);
+            pthread_kill(copier, SIGUSR1);
+            QTest::qWait(100);
+            QVERIFY(!copied.isFinished());
+            job.cancelled = true;
+            QTRY_VERIFY(copied.isFinished());
+            QVERIFY(!copied.result());
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QVERIFY(!QFileInfo::exists(to.filePath(name)));
+        }
+    }
+
+    void fileOpsCopyWaitsOutAPipesPause()
+    {
+        // A writer that goes quiet for longer than the copy's 100 ms looks for Stop is waited for, and what it sends after still arrives.
+        QTemporaryDir from, to;
+        const QByteArray pipe = QFile::encodeName(from.filePath("pipe"));
+        QVERIFY(mkfifo(pipe.constData(), 0600) == 0);
+        FileOps::Job job;
+        QString error;
+        QFuture<bool> copied = QtConcurrent::run(
+            [&] { return FileOps::copyRecursively(from.filePath("pipe"), to.filePath("pipe"), &error, false, &job); });
+        int writer = -1;
+        const auto finish = qScopeGuard([&] {
+            job.cancelled = true;
+            if (writer >= 0)
+                close(writer);
+            copied.waitForFinished();
+        });
+        QVERIFY(QTest::qWaitFor([&] { return (writer = open(pipe.constData(), O_WRONLY | O_NONBLOCK)) >= 0; }));
+        QCOMPARE(::write(writer, "first ", 6), 6);
+        QTRY_COMPARE(job.bytes.load(), 6);
+        QTest::qWait(300);
+        QVERIFY(!copied.isFinished());
+        QCOMPARE(::write(writer, "second", 6), 6);
+        close(std::exchange(writer, -1));
+        QTRY_VERIFY(copied.isFinished());
+        QVERIFY(copied.result());
+        QCOMPARE(contents(to.filePath("pipe")), QByteArray("first second"));
+    }
+
+    void fileOpsCopyWaitsOutALease()
+    {
+        // A file another program holds a lease on is copied whole once the lease is given up.
+        QTemporaryDir from, to;
+        write(from.filePath("leased"), "kept");
+        const int holder = open(QFile::encodeName(from.filePath("leased")).constData(), O_RDWR);
+        QVERIFY(holder >= 0);
+        // Breaking a lease tells its holder with SIGIO, which would end the test.
+        const auto io = signal(SIGIO, SIG_IGN);
+        const auto restored = qScopeGuard([&] {
+            close(holder);
+            signal(SIGIO, io);
+        });
+        if (fcntl(holder, F_SETLEASE, F_WRLCK) != 0)
+            QSKIP("This filesystem gives no leases.");
+        FileOps::Job job;
+        QString error;
+        QFuture<bool> copied = QtConcurrent::run(
+            [&] { return FileOps::copyRecursively(from.filePath("leased"), to.filePath("leased"), &error, false, &job); });
+        const auto finish = qScopeGuard([&] {
+            job.cancelled = true;
+            fcntl(holder, F_SETLEASE, F_UNLCK);
+            copied.waitForFinished();
+        });
+        // The copy's open has asked for the lease to be given up.
+        QTRY_COMPARE(fcntl(holder, F_GETLEASE), F_RDLCK);
+        QCOMPARE(fcntl(holder, F_SETLEASE, F_UNLCK), 0);
+        QTRY_VERIFY(copied.isFinished());
+        QVERIFY(copied.result());
+        QCOMPARE(contents(to.filePath("leased")), QByteArray("kept"));
+    }
+
     void fileOpsCancelledMoveAcrossDrivesKeepsOriginals()
     {
         // Across drives each original goes once it's copied, so a move
@@ -2028,19 +2859,29 @@ private slots:
         QDir(dir.path()).mkdir("sub");
         FileOps ops;
         QSignalSpy notice(&ops, &FileOps::notice), failed(&ops, &FileOps::failed);
+        // Each rename is told, so the sidebar's pins follow it: by Rename,
+        // and by undoing and redoing one. A blank name renames nothing.
+        QSignalSpy renamed(&ops, &FileOps::renamed);
+        const auto lastRename = [&] { return renamed.last().at(0).toString() + " > " + renamed.last().at(1).toString(); };
         QCOMPARE(ops.undoName(), QString());
 
+        QCOMPARE(ops.rename(dir.filePath("a.txt"), "  "), QString());
+        QCOMPARE(renamed.count(), 0);
         QCOMPARE(ops.rename(dir.filePath("a.txt"), "b.txt"), QString());
+        QCOMPARE(lastRename(), dir.filePath("a.txt") + " > " + dir.filePath("b.txt"));
         QCOMPARE(ops.undoName(), QString("Undo Rename"));
         ops.undo();
         QTRY_VERIFY(ops.busy().isEmpty());
         QVERIFY(QFile::exists(dir.filePath("a.txt")));
         QVERIFY(!QFile::exists(dir.filePath("b.txt")));
         QCOMPARE(notice.last().first().toString(), QString("Undid renaming a.txt."));
+        QCOMPARE(lastRename(), dir.filePath("b.txt") + " > " + dir.filePath("a.txt"));
         ops.redo();
         QTRY_VERIFY(ops.busy().isEmpty());
         QVERIFY(QFile::exists(dir.filePath("b.txt")));
         QCOMPARE(notice.last().first().toString(), QString("Redid renaming a.txt."));
+        QCOMPARE(lastRename(), dir.filePath("a.txt") + " > " + dir.filePath("b.txt"));
+        const int renames = renamed.count();
 
         ops.cut({dir.filePath("b.txt"), dir.filePath("c.txt")});
         ops.paste(dir.filePath("sub"));
@@ -2074,6 +2915,8 @@ private slots:
         QVERIFY(QDir(dir.filePath("sub")).isEmpty());
         QCOMPARE(QDir(data.filePath("Trash/files")).entryList(QDir::Files), QStringList({"b.txt", "c.txt"}));
         QCOMPARE(failed.count(), 0);
+        // Moving and trashing aren't renaming.
+        QCOMPARE(renamed.count(), renames);
 
         // Undo goes back through them all, the newest first.
         for (int i = 0; i < 3; ++i) {
@@ -2084,6 +2927,9 @@ private slots:
         QCOMPARE(contents(dir.filePath("c.txt")), QByteArray("c"));
         QCOMPARE(ops.undoName(), QString());
         QCOMPARE(failed.count(), 0);
+        // The last of them a rename, told as the others weren't.
+        QCOMPARE(renamed.count(), renames + 1);
+        QCOMPARE(lastRename(), dir.filePath("b.txt") + " > " + dir.filePath("a.txt"));
     }
 
     void undoAndRedoPasteAndReplace()
@@ -3205,9 +4051,39 @@ private slots:
         QTemporaryDir home;
         write(home.filePath("report.pdf"), "x");
         Backend backend(home.path());
-        backend.showItem(home.filePath("report.pdf"));
+        // As QML calls it, through the meta-object system.
+        QVERIFY(QMetaObject::invokeMethod(&backend, "showItem", Q_ARG(QString, home.filePath("report.pdf"))));
         QCOMPARE(backend.path(), home.path());
         QCOMPARE(backend.takeSelection(), QString("report.pdf"));
+    }
+
+    void folderModelListsWhileOtherWorkIsStuck()
+    {
+        // Every thread of the global pool busy, and seven listings hung on dead mounts.
+        QTemporaryDir dir;
+        write(dir.filePath("a.txt"), "x");
+        QThreadPool *pool = QThreadPool::globalInstance();
+        pool->waitForDone();
+        FolderModel::listingPool().waitForDone();
+        std::atomic<bool> hold = true;
+        const auto stuck = [&] {
+            while (hold)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        };
+        for (int i = 0; i < pool->maxThreadCount(); ++i)
+            pool->start(stuck);
+        for (int i = 0; i < 7; ++i)
+            FolderModel::listingPool().start(stuck);
+        const auto release = qScopeGuard([&] {
+            hold = false;
+            pool->waitForDone();
+            FolderModel::listingPool().waitForDone();
+        });
+        FolderModel model;
+        QSignalSpy loaded(&model, &FolderModel::loaded);
+        model.setPath(dir.path());
+        QVERIFY(loaded.wait(3000));
+        QCOMPARE(model.count(), 1);
     }
 
     void backendReadsDetailsOffTheUiThread()
@@ -3305,7 +4181,7 @@ private slots:
             return list;
         };
         QCOMPARE(names(Places(home.path())),
-                 QStringList({"Documents", "Omarchy", "project9", "project10", "Work"}));
+                 QStringList({"Documents", "Omarchy", "Project9", "Project10", "Work"}));
 
         // The XDG folders have glyphs of their own; Dropbox's mark comes
         // from its plugin.
@@ -3353,6 +4229,73 @@ private slots:
         QVERIFY(saved.contains("Work/folio"));
         QVERIFY(!saved.contains("Work/hype"));
         QCOMPARE(places.pinned().size(), 1);
+    }
+
+    // Hide in a Home folder's sidebar menu takes it out of Home; Show in
+    // Home puts it back. A hidden one can be pinned, and a rename takes its
+    // hiding (or its pin) along.
+    void placesHideFoldersFromHome()
+    {
+        QTemporaryDir home;
+        for (const char *dir : {"Work", "go", "Dropbox", "Elsewhere/deep"})
+            QDir(home.path()).mkpath(dir);
+        auto names = [](const Places &p) {
+            QStringList list;
+            for (const auto &v : p.places()) list << v.toMap().value("name").toString();
+            return list;
+        };
+        Places places(home.path());
+        QCOMPARE(names(places), QStringList({"Dropbox", "Elsewhere", "Go", "Work"}));
+
+        places.hideFromHome(home.filePath("go"));
+        QCOMPARE(names(places), QStringList({"Dropbox", "Elsewhere", "Work"}));
+        QVERIFY(places.hiddenFromHome(home.filePath("go")));
+        QVERIFY(!places.hiddenFromHome(home.filePath("Work")));
+        // Only home's own folders are hidden from Home.
+        places.hideFromHome(home.filePath("Elsewhere/deep"));
+        QVERIFY(!places.hiddenFromHome(home.filePath("Elsewhere/deep")));
+        // Kept between launches.
+        QCOMPARE(names(Places(home.path())), QStringList({"Dropbox", "Elsewhere", "Work"}));
+
+        // No longer under Home, it can be pinned.
+        QCOMPARE(places.pin(home.filePath("go")), QString());
+        QCOMPARE(places.pinned().size(), 1);
+
+        // Renamed, it stays hidden and pinned under its new name.
+        QVERIFY(QDir(home.path()).rename("go", "golang"));
+        places.renamed(home.filePath("go"), home.filePath("golang"));
+        QVERIFY(places.hiddenFromHome(home.filePath("golang")));
+        QVERIFY(!places.hiddenFromHome(home.filePath("go")));
+        QVERIFY(places.isPinned(home.filePath("golang")));
+        QCOMPARE(names(places), QStringList({"Dropbox", "Elsewhere", "Work"}));
+
+        // Shown in Home again, it's there rather than among the pins.
+        places.showInHome(home.filePath("golang"));
+        QCOMPARE(names(places), QStringList({"Dropbox", "Elsewhere", "Golang", "Work"}));
+        QVERIFY(!places.hiddenFromHome(home.filePath("golang")));
+        QCOMPARE(places.pinned().size(), 0);
+
+
+        // A name is kept whole, whatever it has in it: hiding one with a
+        // newline hides it, not folders named after its halves.
+        QVERIFY(QDir(home.path()).mkdir("Two\nLines"));
+        QVERIFY(QDir(home.path()).mkdir("Two"));
+        Places lines(home.path());
+        lines.hideFromHome(home.filePath("Two\nLines"));
+        QVERIFY(lines.hiddenFromHome(home.filePath("Two\nLines")));
+        QVERIFY(!lines.hiddenFromHome(home.filePath("Two")));
+        QVERIFY(names(Places(home.path())).contains("Two"));
+        QVERIFY(!names(Places(home.path())).contains("Two\nLines"));
+        lines.showInHome(home.filePath("Two\nLines"));
+        // A save that fails says so, and changes nothing.
+        const QString settings = home.filePath(".config/folio");
+        QVERIFY(QFile::setPermissions(settings, QFile::ReadOwner | QFile::ExeOwner));
+        QSignalSpy failed(&places, &Places::failed);
+        places.hideFromHome(home.filePath("Work"));
+        QCOMPARE(failed.count(), 1);
+        QVERIFY(failed.last().first().toString().startsWith("Couldn't save the hidden folders"));
+        QVERIFY(names(places).contains("Work"));
+        QVERIFY(QFile::setPermissions(settings, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
     }
 
     void typedViewsGoToTheirView()
@@ -4846,7 +5789,7 @@ private slots:
 
         QMetaObject::invokeMethod(window, "ask");
         QCOMPARE(focused(), QString("Empty"));
-        for (const QString &next : {"Cancel", "Empty", "Cancel"}) {
+        for (const QString next : {"Cancel", "Empty", "Cancel"}) {
             QTest::keyClick(window, Qt::Key_Tab);
             QCOMPARE(focused(), next);
         }
@@ -5358,6 +6301,52 @@ private slots:
         QCOMPARE(Thumbnails::bucketFor(512), QString("x-large"));
     }
 
+    // The details' sharp pictures: a large one is made once at the size
+    // asked for and kept, then read back from Folio's own cache until it
+    // changes; a small one is read as it is.
+    void thumbnailsKeepSharpPictures()
+    {
+        QTemporaryDir dir;
+        const QString big = dir.filePath("big.png"), small = dir.filePath("small.png");
+        QImage picture(3000, 2000, QImage::Format_RGB32);
+        picture.fill(Qt::darkCyan);
+        QVERIFY(picture.save(big));
+        QVERIFY(picture.scaled(400, 300).save(small));
+        Thumbnails thumbnails(dir.filePath("cache/thumbnails"), {dir.filePath("none")});
+
+        bool fresh = false;
+        QDateTime read;
+        QImage image = thumbnails.sharp(big, "image/png", 1024, &fresh, &read);
+        QVERIFY(fresh);
+        QCOMPARE(image.size(), QSize(1024, 682));
+        QCOMPARE(read, QFileInfo(big).lastModified());
+        thumbnails.keep(image, big, 1024, read);
+        const QString kept = dir.filePath("cache/folio/sharp/1024/") + Thumbnails::cacheKey(big).chopped(4) + ".jpg";
+        QVERIFY2(QFileInfo::exists(kept), qPrintable(kept));
+        // Only its owner may read it, and the folders it's in.
+        QCOMPARE(QFileInfo(kept).permissions() & (QFile::ReadGroup | QFile::ReadOther), QFileDevice::Permissions());
+        QCOMPARE(QFileInfo(QFileInfo(kept).absolutePath()).permissions() & (QFile::ReadOther | QFile::ExeOther), QFileDevice::Permissions());
+        // Kept under the time it was read at, not the file's time now: one
+        // saved over while it was read is made again.
+        QCOMPARE(QFileInfo(kept).lastModified(), read);
+        image = thumbnails.sharp(big, "image/png", 1024, &fresh, &read);
+        QVERIFY(!fresh);
+        QCOMPARE(image.size(), QSize(1024, 682));
+
+        // Changed, it's made again.
+        {
+            QFile file(big);
+            QVERIFY(file.open(QIODevice::ReadWrite));
+            QVERIFY(file.setFileTime(QDateTime::currentDateTime().addSecs(60), QFileDevice::FileModificationTime));
+        }
+        thumbnails.sharp(big, "image/png", 1024, &fresh, &read);
+        QVERIFY(fresh);
+
+        image = thumbnails.sharp(small, "image/png", 1024, &fresh, &read);
+        QVERIFY(!fresh);
+        QCOMPARE(image.size(), QSize(400, 300));
+    }
+
     void thumbnailsFollowAPictureSavedOver()
     {
         // Qt keeps the images it has shown by their URL, and a re-read makes
@@ -5433,6 +6422,62 @@ private slots:
         // the one it names.
         write(dir.filePath("photo.heic"), "not a real heic");
         QCOMPARE(thumbnails.load(dir.filePath("photo.heic"), "image/*", 128).size(), QSize(64, 32));
+
+        // What failed is remembered with the round it failed in, and one
+        // remembered from before a fix (files on other machines) is tried
+        // again.
+        write(dir.filePath("broken.thumbnailer"), "[Thumbnailer Entry]\nExec=/bin/false %o\nMimeType=image/x-broken;\n");
+        Thumbnails withBroken(dir.filePath("cache"), {dir.path()});
+        write(dir.filePath("never.broken"), "x");
+        QVERIFY(withBroken.load(dir.filePath("never.broken"), "image/x-broken", 128).isNull());
+        const QImage marker(dir.filePath("cache/fail/folio/" + Thumbnails::cacheKey(dir.filePath("never.broken"))));
+        QCOMPARE(marker.text("X-Folio::Round"), QString("2"));
+        // An old marker, without its round, for a picture that can be made.
+        const QFileInfo picture(dir.filePath("frame.png"));
+        QImage old(1, 1, QImage::Format_ARGB32);
+        old.setText("Thumb::MTime", QString::number(picture.lastModified().toSecsSinceEpoch()));
+        old.setText("X-Folio::MTime", QString::number(picture.lastModified().toMSecsSinceEpoch()));
+        QVERIFY(old.save(dir.filePath("cache/fail/folio/" + Thumbnails::cacheKey(picture.filePath()))));
+        QVERIFY(!withBroken.load(picture.filePath(), "image/png", 128).isNull());
+    }
+
+    // A file on another machine goes to a thumbnailer given a URI by a link
+    // to it, a file:// one with its extension: GIO would turn the mount's
+    // own path back into sftp://, which most thumbnailers can't open. The
+    // thumbnail is still kept under the file's own path.
+    void thumbnailsReachOtherMachinesByALink()
+    {
+        QTemporaryDir dir;
+        QImage frame(64, 32, QImage::Format_RGB32);
+        frame.fill(Qt::green);
+        QVERIFY(frame.save(dir.filePath("frame.png")));
+        // Says what it was given, and makes the frame its thumbnail.
+        write(dir.filePath("record"), "#!/bin/sh\necho \"$1\" > \"" + dir.filePath("given").toUtf8()
+              + "\"\ncp \"" + dir.filePath("frame.png").toUtf8() + "\" \"$2\"\n");
+        QVERIFY(QFile::setPermissions(dir.filePath("record"), QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        write(dir.filePath("record.thumbnailer"),
+              "[Thumbnailer Entry]\nExec=" + dir.filePath("record").toUtf8() + " %u %o\nMimeType=application/pdf;\n");
+        QDir(dir.path()).mkpath("gvfs/sftp:host=far/home");
+        const QString remote = dir.filePath("gvfs/sftp:host=far/home/Order 42.pdf");
+        write(remote, "%PDF");
+        Thumbnails thumbnails(dir.filePath("cache"), {dir.path()}, dir.filePath("gvfs"));
+
+        QVERIFY(!thumbnails.load(remote, "application/pdf", 128).isNull());
+        QFile given(dir.filePath("given"));
+        QVERIFY(given.open(QIODevice::ReadOnly));
+        const QUrl url(QString::fromUtf8(given.readAll()).trimmed());
+        QCOMPARE(url.scheme(), QString("file"));
+        QVERIFY2(!url.toLocalFile().startsWith(dir.filePath("gvfs")), qPrintable(url.toString()));
+        QCOMPARE(QFileInfo(url.toLocalFile()).fileName(), QString("input.pdf"));
+        QVERIFY(QFile::exists(dir.filePath("cache/normal/" + Thumbnails::cacheKey(remote))));
+
+        // A file here goes as it is.
+        const QString local = dir.filePath("Order 43.pdf");
+        write(local, "%PDF");
+        QVERIFY(!thumbnails.load(local, "application/pdf", 128).isNull());
+        given.close();
+        QVERIFY(given.open(QIODevice::ReadOnly));
+        QCOMPARE(QUrl(QString::fromUtf8(given.readAll()).trimmed()).toLocalFile(), local);
     }
 
     void thumbnailsSetTextOnAPage()
@@ -5507,6 +6552,34 @@ private slots:
         Previewer previewer;
         previewer.start(dir.filePath("blob.txt"), false, "name");
         QTRY_COMPARE(previewer.viewer(), QString("other"));
+    }
+
+    // The preview window loads as the app loads it, its shortcuts with it.
+    void previewWindowLoads()
+    {
+        QTemporaryDir dir;
+        write(dir.filePath("notes.txt"), "hello\n");
+        Theme theme(dir.filePath("theme"));
+        Translator translator(dir.filePath("language"), dir.path());
+        Thumbnails thumbnails(dir.filePath("cache"), {dir.filePath("none")});
+        Previewer previewer;
+        previewer.start(dir.filePath("notes.txt"), false, "name");
+        QQmlApplicationEngine engine;
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("previewer", &previewer);
+        QStringList problems;
+        QObject::connect(&engine, &QQmlApplicationEngine::warnings, [&](const QList<QQmlError> &warnings) {
+            for (const QQmlError &warning : warnings)
+                problems << warning.toString();
+        });
+        engine.load(QUrl("qrc:/PreviewWindow.qml"));
+        QVERIFY2(!engine.rootObjects().isEmpty(), qPrintable(problems.join("\n")));
+        QObject *window = engine.rootObjects().first();
+        window->setProperty("helpVisible", true);
+        QCoreApplication::processEvents();
+        QVERIFY2(problems.isEmpty(), qPrintable(problems.join("\n")));
     }
 
     void previewerShowsOnlyWhatLaysOutQuickly()
@@ -5677,6 +6750,274 @@ private slots:
         QVERIFY(!FolderModel::toMap(FolderModel::Entry()).contains("peek"));
     }
 
+    void folderKeyboardScrolls_data()
+    {
+        QTest::addColumn<QString>("viewType");
+        QTest::newRow("grid") << QString("FolderGrid");
+        QTest::newRow("list") << QString("FolderList");
+        QTest::newRow("columns") << QString("FolderColumns");
+    }
+
+    void folderKeyboardScrolls()
+    {
+        QFETCH(QString, viewType);
+        QTemporaryDir home;
+        QVERIFY(QDir(home.path()).mkdir("files"));
+        for (int i = 0; i < 80; ++i)
+            write(home.filePath(QString("files/file-%1.txt").arg(i, 2, 10, QLatin1Char('0'))), "x");
+        Backend backend(home.path());
+        backend.navigate(home.filePath("files"));
+        QTRY_COMPARE(backend.folder()->rowCount(), 80);
+        Theme theme(home.filePath("theme"));
+        FileOps fileOps;
+        Translator translator(home.filePath("language"), home.path());
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("plugins", QVariantMap{{"views", QVariantMap{}}});
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        QQmlComponent component(&engine);
+        component.setData(QString(R"(
+            import QtQuick
+            Window {
+                width: 600; height: 480; visible: true
+                property alias cursor: folderView.currentIndex
+                %1 { id: folderView; anchors.fill: parent; Component.onCompleted: focusView() }
+                function letGo() { folderView.letGo() }
+                function cursorInView() {
+                    const item = folderView.menuAnchor()
+                    const y = item ? item.mapToItem(null, 0, 0).y : -1
+                    return y >= 0 && y + item.height <= height
+                }
+            }
+        )").arg(viewType).toUtf8(), QUrl::fromLocalFile(sourceFolder() + "/KeyboardScrollTest.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        auto *window = qobject_cast<QQuickWindow *>(root.get());
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+        const auto cursorInView = [&] {
+            QVariant inView;
+            QMetaObject::invokeMethod(root.get(), "cursorInView", Q_RETURN_ARG(QVariant, inView));
+            return inView.toBool();
+        };
+        // Thirty presses take the cursor well past the fold in every view.
+        for (int i = 0; i < 30; ++i) {
+            QTest::keyClick(window, Qt::Key_Down);
+            QTRY_VERIFY(cursorInView());
+        }
+        QVERIFY(root->property("cursor").toInt() >= 29);
+
+        // Page Down moves a screenful (more than one row, keeping the
+        // cursor in sight), Page Up as far back, and both stop at the ends.
+        root->setProperty("cursor", 0);
+        QTRY_VERIFY(cursorInView());
+        const int before = 0;
+        QTest::keyClick(window, Qt::Key_PageDown);
+        const int paged = root->property("cursor").toInt() - before;
+        QVERIFY2(paged > 1, qPrintable(QString::number(paged)));
+        QTRY_VERIFY(cursorInView());
+        QCOMPARE(backend.folder()->selectedCount(), 1);
+        QTest::keyClick(window, Qt::Key_PageUp);
+        QCOMPARE(root->property("cursor").toInt(), before);
+        QTRY_VERIFY(cursorInView());
+        for (int i = 0; i < 80; ++i)
+            QTest::keyClick(window, Qt::Key_PageDown);
+        QCOMPARE(root->property("cursor").toInt(), 79);
+        // With Shift, it selects the way there.
+        QTest::keyClick(window, Qt::Key_PageUp, Qt::ShiftModifier);
+        QCOMPARE(backend.folder()->selectedCount(), paged + 1);
+        for (int i = 0; i < 80; ++i)
+            QTest::keyClick(window, Qt::Key_PageUp);
+        QCOMPARE(root->property("cursor").toInt(), 0);
+        QTRY_VERIFY(cursorInView());
+
+        // Let go of (a click on empty space), Shift+Page Down selects from
+        // the first item on, and again keeps what it selected.
+        QMetaObject::invokeMethod(root.get(), "letGo");
+        QCOMPARE(root->property("cursor").toInt(), -1);
+        QTest::keyClick(window, Qt::Key_PageDown, Qt::ShiftModifier);
+        QTest::keyClick(window, Qt::Key_PageDown, Qt::ShiftModifier);
+        QCOMPARE(root->property("cursor").toInt(), 2 * paged);
+        QCOMPARE(backend.folder()->selectedCount(), 2 * paged + 1);
+    }
+
+    // The list's keys for its tree, as the Finder's: → opens a folder in
+    // place, then steps into it; ← steps back out to the folder, closes it,
+    // and from the top goes up a folder. A click on a folder's arrow opens
+    // or closes it.
+    void listWalksItsTree()
+    {
+        QTemporaryDir home;
+        QDir(home.path()).mkpath("files/alpha");
+        write(home.filePath("files/alpha/inside.txt"), "x");
+        write(home.filePath("files/beside.txt"), "x");
+        Backend backend(home.path());
+        backend.navigate(home.filePath("files"));
+        QTRY_COMPARE(backend.folder()->rowCount(), 2);
+        Theme theme(home.filePath("theme"));
+        FileOps fileOps;
+        Translator translator(home.filePath("language"), home.path());
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("plugins", QVariantMap{{"views", QVariantMap{}}});
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        QQmlComponent component(&engine);
+        component.setData(R"(
+            import QtQuick
+            Window {
+                width: 700; height: 300; visible: true
+                property alias cursor: folderView.currentIndex
+                FolderList { id: folderView; anchors.fill: parent; Component.onCompleted: focusView() }
+                function clickRow(row, modifiers) { folderView.itemAtIndex(row).clicked(modifiers) }
+            }
+        )", QUrl::fromLocalFile(sourceFolder() + "/ListTreeTest.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        auto *window = qobject_cast<QQuickWindow *>(root.get());
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+        FolderModel *folder = backend.folder();
+        root->setProperty("cursor", 0);
+
+        QTest::keyClick(window, Qt::Key_Right);
+        QTRY_COMPARE(folder->rowCount(), 3);
+        QVERIFY(folder->isExpanded(0));
+        QCOMPARE(root->property("cursor").toInt(), 0);
+        QTest::keyClick(window, Qt::Key_Right);
+        QCOMPARE(root->property("cursor").toInt(), 1);
+        QCOMPARE(folder->get(1).value("name").toString(), QString("inside.txt"));
+        QTest::keyClick(window, Qt::Key_Left);
+        QCOMPARE(root->property("cursor").toInt(), 0);
+        QTest::keyClick(window, Qt::Key_Left);
+        QCOMPARE(folder->rowCount(), 2);
+        QVERIFY(!folder->isExpanded(0));
+        QCOMPARE(backend.path(), home.filePath("files"));
+
+        // The arrow, at the row's start, opens it too, without moving into it.
+        QTest::mouseClick(window, Qt::LeftButton, {}, QPoint(13, 16));
+        QTRY_COMPARE(folder->rowCount(), 3);
+        QCOMPARE(backend.path(), home.filePath("files"));
+        QTest::qWait(200);
+        window->grabWindow().save(sourceFolder() + "/../build/tree.png");
+        QTest::mouseClick(window, Qt::LeftButton, {}, QPoint(13, 16));
+        QCOMPARE(folder->rowCount(), 2);
+
+        // From the top, ← goes up a folder, as before.
+        QTest::keyClick(window, Qt::Key_Left);
+        QTRY_COMPARE(backend.path(), home.path());
+
+        // Rows a folder opening lists above the cursor move its row, not
+        // the cursor: what's selected stays selected.
+        backend.navigate(home.filePath("files"));
+        QTRY_COMPARE(folder->rowCount(), 2);
+        root->setProperty("cursor", 1);
+        folder->selectRange(0, 1, false);
+        QCOMPARE(folder->selectedCount(), 2);
+        folder->setExpanded(0, true);
+        QTRY_COMPARE(folder->rowCount(), 3);
+        QCOMPARE(root->property("cursor").toInt(), 2);
+        QCOMPARE(folder->get(2).value("name").toString(), QString("beside.txt"));
+        QCOMPARE(folder->selectedCount(), 2);
+
+        // The range's start keeps to its own item too, though the folder
+        // opened between it and the cursor: a Shift-click then selects from
+        // it, not from where its row was.
+        folder->setExpanded(0, false);
+        QCOMPARE(folder->rowCount(), 2);
+        QDir(home.path()).mkpath("files/beta");
+        write(home.filePath("files/beta/in-beta.txt"), "x");
+        QTRY_COMPARE(folder->rowCount(), 3);
+        // alpha, beta, beside.txt: start on alpha, Shift-click beside.txt.
+        QMetaObject::invokeMethod(root.get(), "clickRow", Q_ARG(QVariant, 0), Q_ARG(QVariant, 0));
+        QMetaObject::invokeMethod(root.get(), "clickRow", Q_ARG(QVariant, 2), Q_ARG(QVariant, int(Qt::ShiftModifier)));
+        QCOMPARE(folder->selectedCount(), 3);
+        folder->setExpanded(1, true);
+        QTRY_COMPARE(folder->rowCount(), 4);
+        // alpha, beta, in-beta.txt, beside.txt: Shift-click in-beta.txt
+        // selects alpha through it.
+        QMetaObject::invokeMethod(root.get(), "clickRow", Q_ARG(QVariant, 2), Q_ARG(QVariant, int(Qt::ShiftModifier)));
+        QCOMPARE(folder->selectedCount(), 3);
+        QVERIFY(folder->isSelected(0));
+        QVERIFY(!folder->isSelected(3));
+    }
+
+    // Renamed inside a folder opened in the list's tree, an item stays
+    // selected under its new name, wherever that sorts it.
+    void listKeepsARenamedNestedItemSelected()
+    {
+        QTemporaryDir home, plugins;
+        QDir(home.path()).mkpath("files/alpha");
+        for (const char *name : {"a.txt", "b.txt", "c.txt"})
+            write(home.filePath(QString("files/alpha/") + name), "x");
+        Backend backend(home.path());
+        Theme theme(home.filePath("theme"));
+        Places places(home.path());
+        FileOps fileOps;
+        Plugins bundled("en", {plugins.path()}, home.filePath("folio.conf"));
+        Translator translator(home.filePath("language"), home.path());
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        QQmlEngine engine;
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("chooser", static_cast<QObject *>(nullptr));
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("plugins", &bundled);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("places", &places);
+        QQmlComponent component(&engine);
+        component.setData(R"(
+            import QtQuick
+            import QtQuick.Controls
+            ApplicationWindow {
+                width: 900; height: 620; visible: true
+                property string viewMode: "list"
+                property real zoom: 1
+                property bool split: false
+                property bool helpVisible: false
+                property var activePane: null
+                function raise() {}
+                function requestActivate() {}
+                FolderPane { id: pane; anchors.fill: parent; focus: true }
+                Component.onCompleted: activePane = pane
+                readonly property var paneItem: pane
+            }
+        )", QUrl::fromLocalFile(sourceFolder() + "/RenameNestedTest.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        auto *window = qobject_cast<QQuickWindow *>(root.get());
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto *pane = root->property("paneItem").value<QObject *>();
+        QVERIFY(pane);
+        QVERIFY(QMetaObject::invokeMethod(pane, "focusView"));
+        FolderModel *folder = backend.folder();
+        backend.navigate(home.filePath("files"));
+        QTRY_COMPARE(folder->count(), 1);
+        folder->setExpanded(0, true);
+        QTRY_COMPARE(folder->count(), 4);
+        const auto cursor = [&] { return pane->property("current").toMap().value("path").toString(); };
+        QVERIFY(QMetaObject::invokeMethod(pane, "focusView"));
+        QTest::keyClick(window, Qt::Key_Down);
+        QTRY_COMPARE(cursor(), home.filePath("files/alpha/a.txt"));
+
+        // a.txt renamed to z.txt sorts last: the cursor goes with it.
+        QCOMPARE(fileOps.rename(home.filePath("files/alpha/a.txt"), "z.txt"), QString());
+        QTRY_COMPARE_WITH_TIMEOUT(cursor(), home.filePath("files/alpha/z.txt"), 3000);
+        QCOMPARE(folder->get(folder->indexOfPath(home.filePath("files/alpha/z.txt"))).value("selected").toBool(), true);
+        QCOMPARE(folder->selectedCount(), 1);
+    }
+
     void gridBandHitsTheTilesBothWays()
     {
         // The rubber band's hit areas sit where the grid put the tiles, also
@@ -5731,6 +7072,60 @@ private slots:
         }
     }
 
+    void folderViewsKeepNoCacheBuffer_data()
+    {
+        QTest::addColumn<QString>("pane");
+        QTest::newRow("grid") << QString("FolderGrid");
+        QTest::newRow("list") << QString("FolderList");
+        QTest::newRow("columns") << QString("FolderColumns");
+    }
+
+    void folderViewsKeepNoCacheBuffer()
+    {
+        // An idle window draws no frames offscreen, so this checks the cause
+        // instead: Qt's pause before filling a cache buffer can leave it drawing.
+        QFETCH(QString, pane);
+        QTemporaryDir home;
+        QVERIFY(QDir(home.path()).mkpath("a/b"));
+        Backend backend(home.path());
+        backend.navigate(home.filePath("a"));
+        QTRY_COMPARE(backend.folder()->rowCount(), 1);
+        Theme theme(home.filePath("theme"));
+        FileOps fileOps;
+        Translator translator(home.filePath("language"), home.path());
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("plugins", QVariantMap{{"views", QVariantMap{}}});
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        QQmlComponent component(&engine);
+        component.setData(QString(R"(
+            import QtQuick
+            Window {
+                width: 800; height: 300; visible: true
+                %1 { id: pane; anchors.fill: parent }
+                function buffersIn(item) {
+                    const own = item instanceof ListView || item instanceof GridView ? [item.cacheBuffer] : []
+                    return own.concat(...Array.from(item.children, child => buffersIn(child)))
+                }
+                function buffers() { return buffersIn(pane) }
+            }
+        )").arg(pane).toUtf8(), QUrl::fromLocalFile(sourceFolder() + "/CacheBufferTest.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        const auto buffers = [&] {
+            QVariant found;
+            QMetaObject::invokeMethod(root.get(), "buffers", Q_RETURN_ARG(QVariant, found));
+            return found.toList();
+        };
+        QTRY_COMPARE(buffers().size(), pane == "FolderColumns" ? 3 : 1);
+        QCOMPARE(buffers(), QVariantList(buffers().size(), 0));
+    }
+
     void themeFallsBack()
     {
         QTemporaryDir dir;
@@ -5777,11 +7172,70 @@ private slots:
         write(command, "#!/bin/sh\ncat '" + response.toUtf8() + "'\n");
         QVERIFY(QFile::setPermissions(command, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
         write(response, "{\"int\":4}");
+        QLocalServer hyprland;
+        QVERIFY(hyprland.listen(dir.filePath("events.sock")));
 
-        Theme theme(dir.path(), nullptr, command);
+        Theme theme(dir.path(), nullptr, command, hyprland.fullServerName());
         QTRY_COMPARE(theme.radius(), 4);
+        QTRY_VERIFY(hyprland.hasPendingConnections());
+        QLocalSocket *events = hyprland.nextPendingConnection();
+        // A theme switch or an edit ends with Hyprland reading its config
+        // again, which it says on its event socket; other events don't count.
         write(response, "{\"int\":6}");
+        events->write("activewindow>>folio,Files\nconfigrel");
+        events->flush();
+        QTest::qWait(300);
+        QCOMPARE(theme.radius(), 4);
+        events->write("oaded>>\n");
         QTRY_COMPARE(theme.radius(), 6);
+    }
+
+    void themeReadsAgainWhenHyprlandReloadsMidRead()
+    {
+        // A reload while a read is still running may come after hyprctl
+        // answered, so the answer can be old: it's read once more.
+        QTemporaryDir dir;
+        const QString response = dir.filePath("response.json"), command = dir.filePath("hyprctl");
+        write(command, "#!/bin/sh\nr=$(cat '" + response.toUtf8() + "')\nsleep 0.3\necho \"$r\"\n");
+        QVERIFY(QFile::setPermissions(command, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        write(response, "{\"int\":1}");
+        QLocalServer hyprland;
+        QVERIFY(hyprland.listen(dir.filePath("events.sock")));
+
+        Theme theme(dir.path(), nullptr, command, hyprland.fullServerName());
+        QTRY_VERIFY(hyprland.hasPendingConnections());
+        QLocalSocket *events = hyprland.nextPendingConnection();
+        QTRY_COMPARE(theme.radius(), 1);
+        emit qGuiApp->applicationStateChanged(Qt::ApplicationActive);
+        QTest::qWait(100);
+        write(response, "{\"int\":5}");
+        events->write("configreloaded>>\n");
+        events->flush();
+        QTRY_COMPARE(theme.radius(), 5);
+    }
+
+    void themeLeavesHyprctlAloneUntilSomethingChanges()
+    {
+        // Each read runs hyprctl, so it's run when the rounding may have
+        // changed, not on a timer for as long as Folio is open.
+        // Kept out of the theme folder, which Theme watches.
+        QTemporaryDir root;
+        QVERIFY(QDir(root.path()).mkpath("theme") && QDir(root.path()).mkpath("bin"));
+        const QString calls = root.filePath("bin/calls"), command = root.filePath("bin/hyprctl");
+        write(command, "#!/bin/sh\necho . >> '" + calls.toUtf8() + "'\necho '{\"int\":2}'\n");
+        QVERIFY(QFile::setPermissions(command, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        QLocalServer hyprland;
+        QVERIFY(hyprland.listen(root.filePath("bin/events.sock")));
+
+        Theme theme(root.filePath("theme"), nullptr, command, hyprland.fullServerName());
+        QTRY_COMPARE(theme.radius(), 2);
+        const auto count = [&] {
+            QFile file(calls);
+            return file.open(QIODevice::ReadOnly) ? file.readAll().count('\n') : 0;
+        };
+        const qsizetype first = count();
+        QTest::qWait(1500);
+        QCOMPARE(count(), first);
     }
 
     void themeAsksForRoundingOnlyWhileActive()
@@ -5800,8 +7254,8 @@ private slots:
 
         Theme theme(themeDir, nullptr, command);
         QTRY_COMPARE(theme.radius(), 3);
-        // Away from Folio, a change goes unnoticed for longer than the poll,
-        // and it's picked up once Folio is back.
+        // Away from Folio, with no reload, a change goes unnoticed, and it's
+        // picked up once Folio is back.
         emit qGuiApp->applicationStateChanged(Qt::ApplicationInactive);
         // A read already under way may still finish (it's killed within
         // 500ms), so the change comes after it.
@@ -5986,6 +7440,640 @@ private slots:
             if (!listed.contains("<file>i18n/" + name + "</file>"))
                 left << name;
         QVERIFY2(left.isEmpty(), qPrintable("not in resources.qrc: " + left.join(", ")));
+    }
+
+    void chooserReadsWhatTheAppAsks()
+    {
+        QTemporaryDir dir;
+        QDir(dir.path()).mkdir("photos");
+        const QList<ChooserFilter> filters{{"Images", {{0, "*.png"}, {1, "image/jpeg"}}}, {"Text", {{0, "*.txt"}}}};
+        QString error;
+
+        ChooserRequest open = chooserRequest(ChooserRequest::Open,
+                                             {{"accept_label", "_Open __here"}, {"multiple", true},
+                                              {"current_folder", QFile::encodeName(dir.filePath("photos")) + '\0'},
+                                              {"filters", QVariant::fromValue(filters)},
+                                              {"current_filter", QVariant::fromValue(filters.at(1))},
+                                              {"choices", "ignored"}, {"modal", "ignored"}},
+                                             &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(open.mode, ChooserRequest::Open);
+        QCOMPARE(open.title, QString("Pick"));
+        QCOMPARE(open.acceptLabel, QString("Open _here"));
+        QVERIFY(open.multiple);
+        QVERIFY(!open.directory);
+        QCOMPARE(open.folder, dir.filePath("photos"));
+        QCOMPARE(open.filters.size(), 2);
+        QCOMPARE(open.filters.at(0).rules.at(1).pattern, QString("image/jpeg"));
+        QCOMPARE(open.filter, 1);
+        QCOMPARE(open.patterns(), QStringList({"*.txt"}));
+
+        // Nothing asked for: one file from home, every file listed.
+        ChooserRequest plain = chooserRequest(ChooserRequest::Open, {{"current_folder", QByteArray("/nowhere/at/all")}}, &error);
+        QVERIFY(error.isEmpty());
+        QVERIFY(!plain.multiple);
+        QCOMPARE(plain.folder, QDir::homePath());
+        QCOMPARE(plain.filter, -1);
+        QCOMPARE(plain.patterns(), QStringList());
+
+        // The first filter when the app names none of them, and one it names
+        // with no list is the only one.
+        QCOMPARE(chooserRequest(ChooserRequest::Open, {{"filters", QVariant::fromValue(filters)}}, &error).filter, 0);
+        QCOMPARE(chooserRequest(ChooserRequest::Open, {{"filters", QVariant::fromValue(filters)},
+                                                       {"current_filter", QVariant::fromValue(ChooserFilter{"Other", {}})}},
+                                &error).filter, 0);
+        ChooserRequest only = chooserRequest(ChooserRequest::Save, {{"current_filter", QVariant::fromValue(filters.at(0))}}, &error);
+        QCOMPARE(only.filters, QList<ChooserFilter>{filters.at(0)});
+        QCOMPARE(only.filter, 0);
+        // Slashes tell a MIME type from a glob, so rules that would be read
+        // as the other kind, or are of no kind, are left out.
+        QCOMPARE(only.patterns(), QStringList({"*.png", "image/jpeg"}));
+        only.filters[0].rules = {{0, "*/x"}, {1, "png"}, {7, "*.png"}, {1, "text/*"}};
+        QCOMPARE(only.patterns(), QStringList({"text/*"}));
+
+        // Choosing a folder lists folders only, whatever the filters.
+        ChooserRequest folders = chooserRequest(ChooserRequest::Open, {{"directory", true}, {"filters", QVariant::fromValue(filters)}}, &error);
+        QVERIFY(folders.directory);
+        QVERIFY(folders.filters.isEmpty());
+        QCOMPARE(folders.patterns(), QStringList({"inode/directory"}));
+
+        // Saving: the suggested name, or an existing file's folder and name.
+        ChooserRequest save = chooserRequest(ChooserRequest::Save, {{"current_name", "notes.txt"},
+                                                                   {"current_folder", QFile::encodeName(dir.path())}}, &error);
+        QCOMPARE(save.folder, dir.path());
+        QCOMPARE(save.name, QString("notes.txt"));
+        save = chooserRequest(ChooserRequest::Save, {{"current_name", "other.txt"},
+                                                    {"current_file", QFile::encodeName(dir.filePath("photos/cat.png")) + '\0'}}, &error);
+        QCOMPARE(save.folder, dir.filePath("photos"));
+        QCOMPARE(save.name, QString("cat.png"));
+
+        ChooserRequest many = chooserRequest(ChooserRequest::SaveFiles, {{"files", QVariant::fromValue(QByteArrayList{
+                                                                            QByteArray("b.txt\0", 6), "a.txt", "é.txt"})}}, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(many.files, QStringList({"b.txt", "a.txt", "é.txt"}));
+    }
+
+    void chooserRefusesMalformedOptionsAndHostileNames()
+    {
+        // Any process on the session bus can call the chooser: an option of
+        // the wrong type is an error, never a crash or a guess.
+        const QList<std::pair<QString, QVariant>> wrong{
+            {"accept_label", 5},
+            {"multiple", "yes"},
+            {"directory", QVariant::fromValue(QDBusVariant(true))},
+            {"current_folder", "/tmp"},
+            {"filters", QStringList{"*.png"}},
+            {"filters", QVariant::fromValue(ChooserFilter{"Images", {}})},
+            {"current_filter", QVariant::fromValue(QList<ChooserFilter>{})},
+        };
+        for (const auto &[key, value] : wrong) {
+            QString error;
+            ChooserRequest::read(ChooserRequest::Open, "", overDBus({{key, value}}), &error);
+            QVERIFY2(error.startsWith(key + " must be of type"), qPrintable(key + ": " + error));
+        }
+        QString error;
+        ChooserRequest::read(ChooserRequest::Save, "", overDBus({{"current_name", QByteArray("x")}}), &error);
+        QVERIFY(error.startsWith("current_name"));
+        ChooserRequest::read(ChooserRequest::SaveFiles, "", overDBus({{"files", QStringList{"a.txt"}}}), &error);
+        QVERIFY(error.startsWith("files must be of type aay"));
+
+        // The names an app gives are names, never paths out of the folder
+        // the user picks: a suggested one is cut to its last part, and a
+        // SaveFiles list holding anything else is refused.
+        const QList<std::pair<QString, QString>> suggested{
+            {"../../.bashrc", ".bashrc"}, {"/etc/passwd", "passwd"}, {"..", ""}, {".", ""}, {"a/..", ""}, {"dir/", ""}};
+        for (const auto &[name, kept] : suggested) {
+            const ChooserRequest save = chooserRequest(ChooserRequest::Save, {{"current_name", name}}, &error);
+            QVERIFY(error.isEmpty());
+            QCOMPARE(save.name, kept);
+        }
+        // An existing file has to be a real one, by its full path.
+        QCOMPARE(chooserRequest(ChooserRequest::Save, {{"current_file", QByteArray("relative.txt")}}, &error).name, QString());
+        QCOMPARE(chooserRequest(ChooserRequest::Save, {{"current_file", QByteArray("/tmp/..")}}, &error).name, QString());
+        for (const QByteArray &name : {QByteArray("../x"), QByteArray("a/b"), QByteArray("."), QByteArray(".."),
+                                       QByteArray(""), QByteArray("/etc/passwd")}) {
+            chooserRequest(ChooserRequest::SaveFiles, {{"files", QVariant::fromValue(QByteArrayList{"fine.txt", name})}}, &error);
+            QVERIFY2(error.startsWith("files must be bare file names"), name.constData());
+        }
+        chooserRequest(ChooserRequest::SaveFiles, {{"files", QVariant::fromValue(QByteArrayList{})}}, &error);
+        QVERIFY(!error.isEmpty());
+        chooserRequest(ChooserRequest::SaveFiles, {}, &error);
+        QVERIFY(!error.isEmpty());
+    }
+
+    void chooserAnswersForEachMode()
+    {
+        QTemporaryDir dir;
+        const QString here = dir.path();
+        QDir(here).mkpath("sub/deeper");
+        write(dir.filePath("a.txt"), "x");
+        write(dir.filePath("b.txt"), "x");
+        const QString a = dir.filePath("a.txt"), b = dir.filePath("b.txt"), sub = dir.filePath("sub");
+        ChooserRequest request;
+
+        // Files: what's picked, folders and plugins' items left out, one
+        // unless several are asked for.
+        QCOMPARE(request.answer(here, {sub, a, b, "plugin:hosts/nas"}, "ignored"), QStringList({a}));
+        request.multiple = true;
+        QCOMPARE(request.answer(here, {sub, a, b}, {}), QStringList({a, b}));
+        QCOMPARE(request.answer(here, {sub}, {}), QStringList());
+        QCOMPARE(request.answer(here, {}, {}), QStringList());
+
+        // Folders: the one shown, since the cursor always rests on one inside
+        // it; only several picked at once are a choice of their own.
+        request.directory = true;
+        QCOMPARE(request.answer(here, {a, sub, dir.filePath("sub/deeper")}, {}), QStringList({sub, dir.filePath("sub/deeper")}));
+        QCOMPARE(request.answer(here, {sub}, {}), QStringList({here}));
+        request.multiple = false;
+        QCOMPARE(request.answer(here, {a, sub, dir.filePath("sub/deeper")}, {}), QStringList({here}));
+        QCOMPARE(request.answer(here, {sub}, {}), QStringList({here}));
+        QCOMPARE(request.answer(here, {a}, {}), QStringList({here}));
+        QCOMPARE(request.answer("recent:", {}, {}), QStringList());
+
+        // Saving: the folder shown and the name typed, which the user (only)
+        // may make a path; a folder or a missing one is no file to save.
+        request = {};
+        request.mode = ChooserRequest::Save;
+        request.name = "suggested.txt";
+        QCOMPARE(request.answer(here, {a}, "new.txt"), QStringList({dir.filePath("new.txt")}));
+        QCOMPARE(request.answer(here, {}, " a.txt "), QStringList({dir.filePath(" a.txt ")}));
+        QCOMPARE(request.answer(here, {}, "sub/deeper/x.txt"), QStringList({dir.filePath("sub/deeper/x.txt")}));
+        QCOMPARE(request.answer(here, {}, "../elsewhere.txt"), QStringList({QFileInfo(here).absolutePath() + "/elsewhere.txt"}));
+        QCOMPARE(request.answer(here, {}, "~/x.txt"), QStringList({QDir::homePath() + "/x.txt"}));
+        QCOMPARE(request.answer(here, {}, sub), QStringList());
+        QCOMPARE(request.answer(here, {}, "sub"), QStringList());
+        QCOMPARE(request.answer(here, {}, "new/"), QStringList());
+        QCOMPARE(request.answer(here, {}, "missing/x.txt"), QStringList());
+        QCOMPARE(request.answer(here, {}, "  "), QStringList());
+        QCOMPARE(request.answer("recent:", {}, "x.txt"), QStringList());
+
+        // SaveFiles: each name, in order, in the folder shown.
+        request.mode = ChooserRequest::SaveFiles;
+        request.files = {"z.txt", "a.txt"};
+        QCOMPARE(request.answer(sub, {a}, "typed"), QStringList({sub + "/z.txt", sub + "/a.txt"}));
+        QCOMPARE(request.answer("plugin:hosts", {}, {}), QStringList());
+
+        QCOMPARE(ChooserDialog::existing({a, sub + "/z.txt", sub}), QStringList({a, sub}));
+        QCOMPARE(ChooserDialog::folders({a, sub + "/z.txt", sub}), QStringList({sub}));
+        QVERIFY(QFile::link(dir.filePath("gone"), dir.filePath("link")));
+        QCOMPARE(ChooserDialog::existing({dir.filePath("link")}), QStringList({dir.filePath("link")}));
+    }
+
+    void chooserFiltersByNameAndType()
+    {
+        // A search's limit counts only what fits, so the files a filter
+        // leaves out can't use it up before the ones it lists.
+        {
+            QTemporaryDir tree;
+            QDir(tree.path()).mkdir("deep");
+            for (const char *name : {"x1.txt", "x2.txt", "deep/x3.png"})
+                write(tree.filePath(name), "x");
+            const auto found = FolderModel::search(tree.path(), "x", false, "name", {}, 1, QLocale(), {"*.png"});
+            QCOMPARE(found.size(), 1);
+            QCOMPARE(found.first().name, QString("deep/x3.png"));
+        }
+
+        const auto entry = [](const QString &name, bool isDir = false) {
+            FolderModel::Entry e;
+            e.name = name;
+            e.path = "/x/" + name;
+            e.isDir = isDir;
+            e.mime = isDir ? "inode/directory" : QMimeDatabase().mimeTypeForFile(name, QMimeDatabase::MatchExtension).name();
+            return e;
+        };
+        const auto fits = [&](const QStringList &filter, const QString &name) { return FolderModel::fits(filter, entry(name)); };
+        QVERIFY(fits({}, "anything"));
+        QVERIFY(FolderModel::fits({"*.png"}, entry("photos", true)));
+        // Globs ignore case, and match the name, not a search result's path.
+        QVERIFY(fits({"*.png"}, "Cat.PNG"));
+        QVERIFY(fits({"*.jp*g", "*.png"}, "cat.jpeg"));
+        QVERIFY(!fits({"*.png"}, "cat.png.txt"));
+        FolderModel::Entry found = entry("cat.png");
+        found.name = "sub/cat.png";
+        QVERIFY(FolderModel::fits({"cat*"}, found));
+        // Types, by name, by group, and by what they inherit.
+        QVERIFY(fits({"image/png"}, "cat.png"));
+        QVERIFY(!fits({"image/png"}, "cat.jpg"));
+        QVERIFY(fits({"image/*"}, "cat.jpg"));
+        QVERIFY(!fits({"image/*"}, "notes.txt"));
+        QVERIFY(fits({"text/plain"}, "main.c"));
+        QVERIFY(fits({"text/*"}, "data.json"));
+        QVERIFY(!fits({"text/plain"}, "cat.png"));
+        QVERIFY(fits({"*/*"}, "cat.png"));
+        // Only folders fit a folder's type.
+        QVERIFY(!fits({"inode/directory"}, "notes.txt"));
+
+        // A folder lists what fits, folders always, and lists again when the
+        // filter changes.
+        QTemporaryDir dir;
+        QDir(dir.path()).mkdir("sub");
+        for (const char *name : {"a.png", "b.PNG", "c.txt", "d.jpg"})
+            write(dir.filePath(name), "x");
+        FolderModel model;
+        const auto listed = [&] {
+            QStringList names;
+            for (int row = 0; row < model.rowCount(); ++row)
+                names << model.get(row).value("name").toString();
+            return names;
+        };
+        model.setFilter({"*.png"});
+        model.setPath(dir.path());
+        QTRY_COMPARE(listed(), QStringList({"sub", "a.png", "b.PNG"}));
+        model.setFilter({"image/jpeg", "text/plain"});
+        QTRY_COMPARE(listed(), QStringList({"sub", "c.txt", "d.jpg"}));
+        model.setFilter({});
+        QTRY_COMPARE(listed().size(), 5);
+    }
+
+    void chooserAnswersExactlyOnce()
+    {
+        QTemporaryDir dir;
+        const QList<ChooserFilter> filters{{"Images", {{0, "*.png"}}}, {"All", {{0, "*"}}}};
+        ChooserRequest request;
+        request.filters = filters;
+        request.filter = 0;
+        QList<std::pair<uint, QVariantMap>> replies;
+        const auto record = [&](uint response, const QVariantMap &results) { replies.append({response, results}); };
+
+        // Answered, it says so once; nothing after (cancelling, closing, the
+        // window going) answers again.
+        auto dialog = std::make_unique<ChooserDialog>(request, ":1.7", record);
+        QSignalSpy done(dialog.get(), &ChooserDialog::done);
+        dialog->accept({});
+        QCOMPARE(replies.size(), 0);
+        dialog->setFilter(1);
+        dialog->setFilter(5);
+        QCOMPARE(dialog->filter(), 1);
+        dialog->accept({dir.filePath("a b#.png"), "/tmp/é"});
+        dialog->accept({"/tmp/again"});
+        dialog->cancel();
+        QVERIFY(dialog->closeFor(":1.7"));
+        dialog.reset();
+        QCOMPARE(replies.size(), 1);
+        QCOMPARE(replies.at(0).first, 0u);
+        QCOMPARE(replies.at(0).second.value("uris").toStringList(),
+                 QStringList({QUrl::fromLocalFile(dir.filePath("a b#.png")).toString(QUrl::FullyEncoded), "file:///tmp/%C3%A9"}));
+        QVERIFY(replies.at(0).second.value("uris").toStringList().at(0).endsWith("/a%20b%23.png"));
+        QCOMPARE(replies.at(0).second.value("current_filter").value<ChooserFilter>(), filters.at(1));
+        QVERIFY(done.size() >= 1);
+
+        // A window closed without an answer cancels, once.
+        replies.clear();
+        dialog = std::make_unique<ChooserDialog>(ChooserRequest{}, ":1.7", record);
+        dialog.reset();
+        QCOMPARE(replies.size(), 1);
+        QCOMPARE(replies.at(0).first, 1u);
+        QVERIFY(!replies.at(0).second.contains("current_filter"));
+
+        // Request.Close: only from the app's own caller, and then cancelled.
+        replies.clear();
+        dialog = std::make_unique<ChooserDialog>(ChooserRequest{}, ":1.7", record);
+        QSignalSpy closed(dialog.get(), &ChooserDialog::done);
+        QVERIFY(!dialog->closeFor(":1.8"));
+        QCOMPARE(replies.size(), 0);
+        QCOMPARE(closed.size(), 0);
+        QVERIFY(dialog->closeFor(":1.7"));
+        QCOMPARE(closed.size(), 1);
+        dialog.reset();
+        QCOMPARE(replies.size(), 1);
+        QCOMPARE(replies.at(0).first, 1u);
+    }
+
+    void chooserWindowAnswersFromTheKeyboard()
+    {
+        // The whole window, as `folio chooser` opens it for each call.
+        QTemporaryDir home, plugins;
+        QDir(home.path()).mkdir("sub");
+        for (const char *name : {"a.txt", "b.png", "c.png"})
+            write(home.filePath(name), "x");
+        Theme theme(home.filePath("theme"));
+        Places places(home.path());
+        Plugins plugged("en", {plugins.path()}, home.filePath("folio.conf"));
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        QQmlEngine engine;
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
+        engine.addImageProvider("plugin-icon", new PluginIconProvider);
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        write(home.filePath("language"), "en\n");
+        Translator translator(home.filePath("language"));
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("places", &places);
+        engine.rootContext()->setContextProperty("plugins", &plugged);
+        // A dialog can reply as the window is destroyed after a failed check.
+        QList<std::pair<uint, QStringList>> replies;
+        Windows windows(&engine, &plugged);
+
+        const auto open = [&](const ChooserRequest &request) -> QQuickWindow * {
+            auto *dialog = new ChooserDialog(request, ":1.1", [&](uint response, const QVariantMap &results) {
+                replies.append({response, results.value("uris").toStringList()});
+            });
+            Backend *backend = windows.open(request.folder, {}, dialog);
+            if (!backend)
+                return nullptr;
+            dialog->setParent(backend);
+            QQuickWindow *window = nullptr;
+            for (QWindow *each : QGuiApplication::topLevelWindows())
+                if (each->isVisible() && each->title() == request.title)
+                    window = qobject_cast<QQuickWindow *>(each);
+            if (window) {
+                window->requestActivate();
+                if (!QTest::qWaitForWindowFocused(window) || !QTest::qWaitFor([&] { return window->property("settled").toBool(); }))
+                    return nullptr;
+            }
+            return window;
+        };
+        const auto uri = [&](const QString &name) { return QUrl::fromLocalFile(home.filePath(name)).toString(); };
+        // The window's own pane, as its QML sees it.
+        const auto paneOf = [](QQuickWindow *window) { return qmlContext(window)->contextProperty("backend").value<Backend *>(); };
+        // What the pane lists, by name.
+        const auto listed = [](QQuickWindow *window) {
+            QStringList names;
+            QObject *pane = window->property("activePane").value<QObject *>();
+            auto *model = pane->property("paneBackend").value<QObject *>()->property("folder").value<FolderModel *>();
+            for (int row = 0; row < model->rowCount(); ++row)
+                names << model->get(row).value("name").toString();
+            return names;
+        };
+
+        // Opening: the app's filter lists what fits, and Return on a file
+        // answers with it and closes the window.
+        ChooserRequest request;
+        request.title = "Open a picture";
+        request.folder = home.path();
+        request.filters = {{"Pictures", {{1, "image/*"}}}};
+        request.filter = 0;
+        QQuickWindow *window = open(request);
+        QVERIFY(window);
+        QTRY_COMPARE(listed(window), QStringList({"sub", "b.png", "c.png"}));
+        // The columns show a file's details as a column after it, and the
+        // details offer no way to open the file in its app instead.
+        const auto column = [&]() -> QQuickItem * {
+            QQuickItem *found = nullptr;
+            const std::function<void(QQuickItem *)> find = [&](QQuickItem *item) {
+                if (!found && item->property("folderPane").isValid() && item->property("takesKeyboard").isValid())
+                    found = item;
+                for (QQuickItem *child : item->childItems())
+                    find(child);
+            };
+            find(window->contentItem());
+            return found;
+        };
+        // On the folder, there's what's inside it instead.
+        QVERIFY(!column());
+        QTest::keyClick(window, Qt::Key_Down);
+        QTRY_VERIFY(column() && column()->isVisible());
+        {
+            QQuickItem *open = nullptr;
+            const std::function<void(QQuickItem *)> find = [&](QQuickItem *item) {
+                // The details' own button: in them, no other says these.
+                const QString text = item->property("text").toString();
+                if (!open && (text == "Open" || text.startsWith("Open with ")))
+                    open = item;
+                for (QQuickItem *child : item->childItems())
+                    find(child);
+            };
+            QTRY_VERIFY((find(column()), open));
+            QVERIFY(!open->isVisible());
+        }
+        QPointer<QQuickWindow> closing(window);
+        QTest::keyClick(window, Qt::Key_Return);
+        QCOMPARE(replies, (QList<std::pair<uint, QStringList>>{{0, {uri("b.png")}}}));
+        QTRY_VERIFY(!closing);
+
+        // Ctrl+F opens the app's filters, and the keyboard picks one.
+        replies.clear();
+        request.title = "Filter from the keys";
+        request.filters = {{"Pictures", {{1, "image/*"}}}, {"Text", {{0, "*.txt"}}}};
+        request.filter = 0;
+        window = open(request);
+        QVERIFY(window);
+        QTRY_COMPARE(listed(window), QStringList({"sub", "b.png", "c.png"}));
+        QTest::keyClick(window, Qt::Key_F, Qt::ControlModifier);
+        QTest::keyClick(window, Qt::Key_Down);
+        QTest::keyClick(window, Qt::Key_Down);
+        QTest::keyClick(window, Qt::Key_Return);
+        // Return went to the menu, not to the bar's answer.
+        QVERIFY(replies.isEmpty());
+        QTRY_COMPARE(listed(window), QStringList({"sub", "a.txt"}));
+        // From a path being typed too: the menu, not the files, takes the
+        // arrows and Return.
+        QTest::keyClick(window, Qt::Key_L, Qt::ControlModifier);
+        QTRY_VERIFY(window->activeFocusItem() && window->activeFocusItem()->property("placeholderText").toString().startsWith("A folder"));
+        QTest::keyClick(window, Qt::Key_F, Qt::ControlModifier);
+        QTest::keyClick(window, Qt::Key_Down);
+        QTest::keyClick(window, Qt::Key_Return);
+        QVERIFY(replies.isEmpty());
+        QTRY_COMPARE(listed(window), QStringList({"sub", "b.png", "c.png"}));
+        // And from a path typed in the right pane of a split, whose bar
+        // leaves the filters to the left one's.
+        QTest::keyClick(window, Qt::Key_N, Qt::ControlModifier | Qt::AltModifier);
+        QTRY_VERIFY(window->property("split").toBool());
+        QTest::keyClick(window, Qt::Key_L, Qt::ControlModifier);
+        QTRY_VERIFY(window->activeFocusItem() && window->activeFocusItem()->property("placeholderText").toString().startsWith("A folder"));
+        QTest::keyClick(window, Qt::Key_F, Qt::ControlModifier);
+        QTest::keyClick(window, Qt::Key_Down);
+        QTest::keyClick(window, Qt::Key_Down);
+        QTest::keyClick(window, Qt::Key_Return);
+        QVERIFY(replies.isEmpty());
+        QTRY_COMPARE(listed(window), QStringList({"sub", "a.txt"}));
+        window->close();
+        QTRY_COMPARE(replies, (QList<std::pair<uint, QStringList>>{{1, {}}}));
+
+        // Escape cancels.
+        replies.clear();
+        request.title = "Open anything";
+        request.filters.clear();
+        request.filter = -1;
+        window = open(request);
+        QVERIFY(window);
+        QTest::keyClick(window, Qt::Key_Escape);
+        QCOMPARE(replies, (QList<std::pair<uint, QStringList>>{{1, {}}}));
+
+        // Choosing a folder lists folders, and answers with the one shown,
+        // not the folder the cursor lands on when it arrives.
+        replies.clear();
+        request.title = "Pick a folder";
+        request.directory = true;
+        QDir(home.path()).mkpath("pick/inner");
+        request.folder = home.filePath("pick");
+        window = open(request);
+        QVERIFY(window);
+        QTRY_COMPARE(listed(window), QStringList({"inner"}));
+        // It arrives with no cursor, so no subfolder looks chosen; the
+        // arrows still put one on the first.
+        const auto cursor = [](QQuickWindow *window) {
+            QObject *pane = window->property("activePane").value<QObject *>();
+            return pane->property("current").toMap().value("path").toString();
+        };
+        QCOMPARE(cursor(window), QString());
+        QTest::keyClick(window, Qt::Key_Down);
+        QTRY_COMPARE(cursor(window), home.filePath("pick/inner"));
+        // An item picked to be shown is still shown, though it has the
+        // name of the folder just left.
+        QDir(home.path()).mkpath("pick/inner/pick");
+        paneOf(window)->showItem(home.filePath("pick/inner/pick"));
+        QTRY_COMPARE(paneOf(window)->path(), home.filePath("pick/inner"));
+        QTRY_COMPARE(cursor(window), home.filePath("pick/inner/pick"));
+        paneOf(window)->goUp();
+        QTRY_COMPARE(paneOf(window)->path(), home.filePath("pick"));
+        QTRY_COMPARE(listed(window), QStringList({"inner"}));
+        QCOMPARE(cursor(window), QString());
+        QTest::keyClick(window, Qt::Key_Return, Qt::ControlModifier);
+        QCOMPARE(replies, (QList<std::pair<uint, QStringList>>{{0, {uri("pick")}}}));
+
+        // Saving starts in the name; a name that's taken asks first, and
+        // Escape there only stops the asking.
+        replies.clear();
+        request = {};
+        request.mode = ChooserRequest::Save;
+        request.title = "Save the notes";
+        request.folder = home.path();
+        request.name = "a.txt";
+        window = open(request);
+        QVERIFY(window);
+        QTRY_VERIFY(window->activeFocusItem() && window->activeFocusItem()->property("text").toString() == "a.txt");
+        // Saving answers with the folder shown too: no cursor on arriving
+        // in one, nor on coming back up out of a subfolder.
+        QCOMPARE(cursor(window), QString());
+        paneOf(window)->navigate(home.filePath("pick"));
+        QTRY_COMPARE(listed(window), QStringList({"inner"}));
+        QCOMPARE(cursor(window), QString());
+        // A search in the same folder puts the cursor on the first match.
+        paneOf(window)->folder()->setQuery("inner");
+        QTRY_COMPARE(cursor(window), home.filePath("pick/inner"));
+        paneOf(window)->goUp();
+        QTRY_COMPARE(paneOf(window)->path(), home.path());
+        QTRY_VERIFY(listed(window).contains("pick"));
+        QCOMPARE(cursor(window), QString());
+        // Nor on going back to a folder that isn't the one just left's.
+        paneOf(window)->navigate(home.filePath("pick/inner"));
+        QTRY_COMPARE(listed(window), QStringList({"pick"}));
+        paneOf(window)->back();
+        QTRY_COMPARE(paneOf(window)->path(), home.path());
+        QTRY_VERIFY(listed(window).contains("pick"));
+        QCOMPARE(cursor(window), QString());
+        // Nor on going back before the folder left had even loaded.
+        QDir(home.path()).mkpath("pick/unseen");
+        paneOf(window)->navigate(home.filePath("pick/unseen"));
+        paneOf(window)->back();
+        QTRY_VERIFY(paneOf(window)->folder()->path() == home.path() && !paneOf(window)->folder()->loading());
+        QTest::qWait(100);
+        QCOMPARE(cursor(window), QString());
+        QTest::keyClick(window, Qt::Key_Return);
+        QTest::keyClick(window, Qt::Key_Escape);
+        QVERIFY(replies.isEmpty());
+        QTest::keyClick(window, Qt::Key_Return, Qt::ControlModifier);
+        QTRY_COMPARE(window->activeFocusItem()->property("text").toString(), QString("Replace"));
+        // Tab goes round the prompt's buttons, not the window behind it.
+        QTest::keyClick(window, Qt::Key_Tab);
+        QTRY_COMPARE(window->activeFocusItem()->property("text").toString(), QString("Cancel"));
+        QTest::keyClick(window, Qt::Key_Backtab, Qt::ShiftModifier);
+        QTRY_COMPARE(window->activeFocusItem()->property("text").toString(), QString("Replace"));
+        QTest::keyClick(window, Qt::Key_Return);
+        QCOMPARE(replies, (QList<std::pair<uint, QStringList>>{{0, {uri("a.txt")}}}));
+
+        // Saving files whose name a folder here has: no file can replace a
+        // folder, so it neither answers nor offers to.
+        replies.clear();
+        ChooserRequest files;
+        files.mode = ChooserRequest::SaveFiles;
+        files.title = "Save the files";
+        files.folder = home.path();
+        files.files = {"new.txt", "sub"};
+        window = open(files);
+        QVERIFY(window);
+        QTest::keyClick(window, Qt::Key_Return, Qt::ControlModifier);
+        QTest::qWait(300);
+        QVERIFY(replies.isEmpty());
+        QVERIFY(window->activeFocusItem()->property("text").toString() != "Replace");
+        QVERIFY(paneOf(window)->notice().contains("sub"));
+        window->close();
+        QTRY_COMPARE(replies, (QList<std::pair<uint, QStringList>>{{1, {}}}));
+
+        // With nothing in the way, the files go into the folder shown.
+        replies.clear();
+        files.title = "Save more files";
+        files.files = {"new.txt", "other.txt"};
+        window = open(files);
+        QVERIFY(window);
+        QTest::keyClick(window, Qt::Key_Return, Qt::ControlModifier);
+        QCOMPARE(replies, (QList<std::pair<uint, QStringList>>{{0, {uri("new.txt"), uri("other.txt")}}}));
+
+        // A folder's name typed to save under goes into that folder, spaces
+        // and all, as a file's name is kept.
+        replies.clear();
+        QDir(home.path()).mkdir(" sp ");
+        QDir(home.path()).mkdir("sp");
+        ChooserRequest into;
+        into.mode = ChooserRequest::Save;
+        into.title = "Save into a folder";
+        into.folder = home.path();
+        window = open(into);
+        QVERIFY(window);
+        QTRY_VERIFY(window->activeFocusItem() && window->activeFocusItem()->property("placeholderText").toString() == "Name");
+        for (const char key : QByteArray(" sp "))
+            QTest::keyClick(window, key);
+        QTest::keyClick(window, Qt::Key_Return);
+        QTRY_COMPARE(paneOf(window)->path(), home.filePath(" sp "));
+        QVERIFY(replies.isEmpty());
+        window->close();
+        QTRY_COMPARE(replies, (QList<std::pair<uint, QStringList>>{{1, {}}}));
+
+        // Tab goes round to the bar as to the window's other parts: out of
+        // the name and back into it when saving, and to the answer when
+        // opening.
+        replies.clear();
+        into.title = "Tab to the name";
+        window = open(into);
+        QVERIFY(window);
+        const auto focusedName = [&] {
+            return window->activeFocusItem() && window->activeFocusItem()->property("placeholderText").toString() == "Name";
+        };
+        QTRY_VERIFY(focusedName());
+        QTest::keyClick(window, Qt::Key_Tab);
+        QTRY_VERIFY(!focusedName());
+        QTest::keyClick(window, Qt::Key_Backtab, Qt::ShiftModifier);
+        QTRY_VERIFY(focusedName());
+        window->close();
+        QTRY_COMPARE(replies, (QList<std::pair<uint, QStringList>>{{1, {}}}));
+
+        replies.clear();
+        QDir(home.path()).mkdir("ren");
+        write(home.filePath("ren/x.txt"), "x");
+        request = {};
+        request.title = "Tab to the answer";
+        request.folder = home.filePath("ren");
+        window = open(request);
+        QVERIFY(window);
+        QTRY_COMPARE(listed(window), QStringList({"x.txt"}));
+        QTest::keyClick(window, Qt::Key_Tab);
+        QTRY_COMPARE(window->activeFocusItem()->property("text").toString(), QString("Open"));
+        QTest::keyClick(window, Qt::Key_Tab);
+        QTRY_VERIFY(window->activeFocusItem()->property("text").toString() != "Open");
+
+        // A pane's own dialog keeps the answer waiting: Ctrl+Return in a
+        // rename doesn't answer the app from under it. (Tab goes on from
+        // the sidebar to the files.)
+        QTest::keyClick(window, Qt::Key_Tab);
+        QTest::keyClick(window, Qt::Key_F2);
+        QTRY_COMPARE(window->activeFocusItem()->property("text").toString(), QString("x.txt"));
+        QTest::keyClick(window, Qt::Key_Return, Qt::ControlModifier);
+        QTest::qWait(300);
+        QVERIFY(replies.isEmpty());
+        window->close();
+        QTRY_COMPARE(replies, (QList<std::pair<uint, QStringList>>{{1, {}}}));
+
+        // Closed without an answer, it cancels; the window going takes the
+        // dialog with it, and nothing answers twice.
+        replies.clear();
+        request.title = "Save elsewhere";
+        window = open(request);
+        QVERIFY(window);
+        closing = window;
+        window->close();
+        QTRY_VERIFY(!closing);
+        QCOMPARE(replies, (QList<std::pair<uint, QStringList>>{{1, {}}}));
     }
 
     void translatorLeavesNumbersUngrouped()
