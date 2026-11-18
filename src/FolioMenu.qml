@@ -23,6 +23,35 @@ Menu {
         return widest
     }
 
+    // Rules go only between entries that show: none at the top or the
+    // bottom, and one where several would meet. Which entries show is only
+    // known once the menu's owner has set it up, so it's done as it opens.
+    function tidyLines() {
+        let entries = 0     // entries shown since the last rule kept
+        let last = null     // the last rule kept, to drop if nothing follows it
+        for (let i = 0; i < count; ++i) {
+            const entry = itemAt(i)
+            if (!entry)
+                continue
+            if (entry.isLine) {
+                entry.tucked = false
+                if (!entry.shown)
+                    continue
+                if (entries === 0) {
+                    entry.tucked = true
+                } else {
+                    last = entry
+                    entries = 0
+                }
+            } else if (entry.shown !== false) {
+                ++entries
+            }
+        }
+        if (entries === 0 && last)
+            last.tucked = true
+    }
+    onAboutToShow: tidyLines()
+
     background: Rectangle {
         implicitWidth: 240
         color: theme.background

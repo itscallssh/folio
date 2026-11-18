@@ -315,8 +315,8 @@ FolioMenu {
     }
     // On empty space, only where the folder shown is one to work in.
     FolioMenuItem {
-        shown: fileMenu.forItem ? fileMenu.forFolder && fileMenu.forFiles
-                                : fileMenu.folder.startsWith("/") && !fileMenu.trashView
+        shown: !fileMenu.trashView && (fileMenu.forItem ? fileMenu.forFolder && fileMenu.forFiles
+                                                       : fileMenu.folder.startsWith("/"))
         text: qsTr("Open Terminal Here")
         onTriggered: fileOps.openTerminal(fileMenu.forItem ? fileMenu.target.path : fileMenu.folder)
     }
