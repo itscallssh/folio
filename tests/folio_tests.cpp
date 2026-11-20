@@ -14,6 +14,8 @@
 #include <memory>
 #include <functional>
 #include <thread>
+#include <algorithm>
+#include <cmath>
 #include <QFile>
 #include <QFontDatabase>
 #include <QGuiApplication>
@@ -84,6 +86,17 @@ static std::unique_ptr<QTemporaryDir> elsewhere()
     if (!dir->isValid() || FileOps::sameDrive(dir->path(), QDir::tempPath()))
         return {};
     return dir;
+}
+
+// WCAG contrast, to check that the tooltip colors read on a palette.
+static double contrast(const QColor &a, const QColor &b)
+{
+    auto linear = [](double v) { return v <= .04045 ? v / 12.92 : std::pow((v + .055) / 1.055, 2.4); };
+    const auto lum = [&](const QColor &c) {
+        return .2126 * linear(c.redF()) + .7152 * linear(c.greenF()) + .0722 * linear(c.blueF());
+    };
+    const double x = lum(a), y = lum(b);
+    return (std::max(x, y) + .05) / (std::min(x, y) + .05);
 }
 
 // `tailscale status --json`, trimmed to what the Tailscale plugin reads, for
@@ -7853,6 +7866,36 @@ private slots:
         write(dir.filePath("theme/colors.toml"), "background = \"#101315\"\nforeground = \"#e0e0e0\"\nlighter_background = \"#2a2e36\"\n");
         Theme distinct(dir.path());
         QCOMPARE(distinct.lighterBackground(), QColor("#2a2e36"));
+    }
+
+    // A hover message is a small surface over the pane. It steps away from
+    // the pane in the theme's own direction (darker when light, lighter when
+    // dark), stays distinct, and writes its words in a readable ink.
+    void themePaintsTooltipsFromThePalette()
+    {
+        QTemporaryDir dir;
+        QDir(dir.path()).mkpath("theme");
+        write(dir.filePath("theme/colors.toml"),
+              "mode = \"light\"\nbackground = \"#faf4ed\"\ndark_background = \"#ede7e1\"\nlighter_background = \"#f2e9e1\"\nforeground = \"#575279\"\n");
+        Theme light(dir.path());
+        QVERIFY(light.tooltipBackground() != light.lighterBackground());
+        QVERIFY(light.tooltipBackground().lightnessF() < light.background().lightnessF());
+        QVERIFY(contrast(light.tooltipBackground(), light.background()) >= 1.4);
+        QVERIFY(contrast(light.tooltipForeground(), light.tooltipBackground()) >= 4.5);
+
+        write(dir.filePath("theme/colors.toml"),
+              "background = \"#1a1b26\"\ndark_background = \"#13141c\"\nlighter_background = \"#24283b\"\nforeground = \"#a9b1d6\"\n");
+        Theme dark(dir.path());
+        QVERIFY(dark.tooltipBackground() != dark.darkBackground());
+        QVERIFY(dark.tooltipBackground().lightnessF() > dark.background().lightnessF());
+        QVERIFY(contrast(dark.tooltipBackground(), dark.background()) >= 1.4);
+        QVERIFY(contrast(dark.tooltipForeground(), dark.tooltipBackground()) >= 4.5);
+
+        write(dir.filePath("theme/colors.toml"),
+              "background = \"#16161a\"\nforeground = \"#c8c8d0\"\n");
+        Theme plain(dir.path());
+        QVERIFY(contrast(plain.tooltipBackground(), plain.background()) >= 1.4);
+        QVERIFY(contrast(plain.tooltipForeground(), plain.tooltipBackground()) >= 4.5);
     }
 
     // Folio's font is the system's fixed-width one, Omarchy's pick, followed

@@ -29,6 +29,10 @@ class Theme : public QObject {
     Q_PROPERTY(QColor orange READ orange NOTIFY changed)
     Q_PROPERTY(bool light READ light NOTIFY changed)
     Q_PROPERTY(int radius READ radius NOTIFY changed)
+    // A tooltip's surface and its words, derived from the theme: a step away
+    // from the pane and text that reads on it, in light and dark themes alike.
+    Q_PROPERTY(QColor tooltipBackground READ tooltipBackground NOTIFY changed)
+    Q_PROPERTY(QColor tooltipForeground READ tooltipForeground NOTIFY changed)
     // The system's fixed-width font (Omarchy's pick of font), by its real
     // family, and how much bigger or smaller than Omarchy's default size the
     // system's text is: Folio's sizes are drawn for that default, and scale
@@ -60,6 +64,8 @@ public:
     QColor orange() const { return color("orange"); }
     bool light() const { return m_light; }
     int radius() const { return m_radius; }
+    QColor tooltipBackground() const;
+    QColor tooltipForeground() const;
     QString fontFamily() const { return m_fontFamily; }
     qreal textScale() const { return m_textScale; }
 

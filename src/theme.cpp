@@ -48,6 +48,51 @@ QColor mix(const QColor &a, const QColor &b, double t) {
                             a.blueF() * (1 - t) + b.blueF() * t);
 }
 
+double ratio(const QColor &a, const QColor &b) {
+    const double x = luminance(a), y = luminance(b);
+    return (std::max(x, y) + .05) / (std::min(x, y) + .05);
+}
+
+// WCAG's minimum contrast for text. A surface needs much less.
+constexpr double textFloor = 4.5;
+constexpr double surfaceFloor = 1.4;
+// The ground luminance where black and white read equally.
+constexpr double midLuminance = .179;
+// Bisection steps in ensureRatio, finer than one eight-bit level.
+constexpr int bisectionSteps = 18;
+// One eight-bit channel's range, so the rounding repair can never step further.
+constexpr int channelRange = 255;
+
+// The ink when it already reads at need, else the least mix toward black or
+// white that still does once rounded to eight-bit channels.
+QColor ensureRatio(const QColor &ink, const QColor &ground, double need) {
+    if (ratio(ink, ground) >= need)
+        return ink;
+    const QColor toward = luminance(ground) > midLuminance ? QColor(Qt::black) : QColor(Qt::white);
+    double low = 0, high = 1;
+    QColor best = toward;
+    for (int i = 0; i < bisectionSteps; ++i) {
+        const double middle = (low + high) / 2;
+        const QColor candidate = mix(ink, toward, middle);
+        if (ratio(candidate, ground) >= need) {
+            best = candidate;
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    best = QColor(best.red(), best.green(), best.blue());
+    const int step = toward == QColor(Qt::white) ? 1 : -1;
+    for (int i = 0; i < channelRange && ratio(best, ground) < need; ++i) {
+        const QColor next(qBound(0, best.red() + step, channelRange), qBound(0, best.green() + step, channelRange),
+                          qBound(0, best.blue() + step, channelRange));
+        if (next == best)
+            break;
+        best = next;
+    }
+    return best;
+}
+
 struct Palette {
     QHash<QString, QColor> colors;
     bool light = false;
@@ -193,6 +238,20 @@ QColor Theme::accentForeground() const {
 // roughly a 4.5:1 contrast for metadata and labels.
 QColor Theme::secondaryForeground() const {
     return mix(background(), foreground(), 0.68);
+}
+
+// A tooltip is a small surface over the pane. Take the theme's own step away
+// from it - darker in light themes, lighter in dark ones - and lift it just
+// enough to read as a card. Material's ToolTip forces its own dark gray, which
+// leaves a light theme's text unreadable on it.
+QColor Theme::tooltipBackground() const {
+    const QColor base = light() ? darkBackground() : lighterBackground();
+    return ensureRatio(base, background(), surfaceFloor);
+}
+
+// Tooltip words: the theme's foreground, raised to textFloor on that surface.
+QColor Theme::tooltipForeground() const {
+    return ensureRatio(foreground(), tooltipBackground(), textFloor);
 }
 
 void Theme::reload() {
