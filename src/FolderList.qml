@@ -19,14 +19,10 @@ FileListView {
     // Where the keyboard's menu (Alt+Return) opens: beside the cursor's item.
     function menuAnchor() { return currentItem }
 
-    // Rows grow with the size step, as the grid's tiles do with theirs: their
-    // height and picture, not the name and details. A value outside the
-    // steps (a hand-edited setting) is held to the ends.
+    // Rows grow with the pane's size step, as the grid's tiles do: their
+    // height and picture, not the name and details.
     property real zoom: 1
-    readonly property real rowZoom: Math.max(1, Math.min(zoom, 2))
-    readonly property int rowHeight: Math.round(32 * rowZoom)
-    signal zoomRequested(int step)
-    ZoomWheel { onZoomRequested: (step) => list.zoomRequested(step) }
+    readonly property int rowHeight: Math.round(32 * zoom)
     // The rows reflow, so bring the cursor's row back into view.
     onRowHeightChanged: Qt.callLater(() => { if (currentIndex >= 0) { forceLayout(); positionViewAtIndex(currentIndex, ListView.Contain) } })
 
@@ -93,7 +89,7 @@ FileListView {
 
     delegate: FileRow {
         width: list.width
-        zoom: list.rowZoom
+        zoom: list.zoom
         detailed: true
         tree: backend.folder.expandable
         current: selected

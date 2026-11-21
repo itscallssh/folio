@@ -1473,7 +1473,6 @@ private slots:
                 width: 900; height: 620; visible: true
                 property string viewMode: "columns"
                 property real zoom: 1
-                property real listZoom: 1
                 property bool split: false
                 property bool helpVisible: false
                 property var activePane: null
@@ -1544,7 +1543,6 @@ private slots:
                 width: 900; height: 620; visible: true
                 property string viewMode: "columns"
                 property real zoom: 1
-                property real listZoom: 1
                 property bool split: false
                 property bool helpVisible: false
                 property var activePane: null
@@ -7998,6 +7996,84 @@ private slots:
 
     // Renamed inside a folder opened in the list's tree, an item stays
     // selected under its new name, wherever that sorts it.
+    // Ctrl+= and Ctrl+-, Ctrl+scroll and Ctrl+0 size the list's rows as
+    // they do the grid's tiles: one size step for the pane, both views.
+    void listRowsFollowTheSizeStep()
+    {
+        QTemporaryDir home, plugins;
+        QDir(home.path()).mkpath("files");
+        for (const char *name : {"a.txt", "b.txt", "c.txt"})
+            write(home.filePath(QString("files/") + name), "x");
+        Backend backend(home.path());
+        Theme theme(home.filePath("theme"));
+        Places places(home.path());
+        FileOps fileOps;
+        Plugins bundled("en", {plugins.path()}, home.filePath("folio.conf"));
+        Translator translator(home.filePath("language"), home.path());
+        qmlRegisterType<FolderModel>("Folio", 1, 0, "FolderModel");
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("chooser", static_cast<QObject *>(nullptr));
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("plugins", &bundled);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("places", &places);
+        QQmlComponent component(&engine);
+        component.setData(R"(
+            import QtQuick
+            import QtQuick.Controls
+            ApplicationWindow {
+                width: 900; height: 620; visible: true
+                property string viewMode: "list"
+                property real zoom: 1
+                property bool split: false
+                property bool helpVisible: false
+                property var activePane: null
+                function raise() {}
+                function requestActivate() {}
+                FolderPane { id: pane; anchors.fill: parent; focus: true }
+                Component.onCompleted: activePane = pane
+                readonly property var paneItem: pane
+            }
+        )", QUrl::fromLocalFile(sourceFolder() + "/ListSizeTest.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        auto *window = qobject_cast<QQuickWindow *>(root.get());
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        auto *pane = root->property("paneItem").value<QObject *>();
+        backend.navigate(home.filePath("files"));
+        QTRY_COMPARE(backend.folder()->count(), 3);
+        QVERIFY(QMetaObject::invokeMethod(pane, "focusView"));
+        QTest::keyClick(window, Qt::Key_Down);
+        QQuickItem *list = nullptr;
+        for (auto *item : root->findChildren<QQuickItem *>())
+            if (item->metaObject()->indexOfProperty("rowHeight") >= 0)
+                list = item;
+        QVERIFY(list);
+        const auto rowHeight = [&] {
+            auto *row = list->property("currentItem").value<QQuickItem *>();
+            return row ? row->height() : 0.0;
+        };
+        QTRY_COMPARE(rowHeight(), 32.0);
+
+        QTest::keyClick(window, Qt::Key_Equal, Qt::ControlModifier);
+        QTRY_COMPARE(rowHeight(), 40.0);
+        const QPointF middle(list->width() / 2, list->height() / 2);
+        QWheelEvent up(list->mapToScene(middle), list->mapToScene(middle), QPoint(), QPoint(0, 240), Qt::NoButton,
+                       Qt::ControlModifier, Qt::NoScrollPhase, false);
+        QGuiApplication::sendEvent(window, &up);
+        QTRY_COMPARE(rowHeight(), 64.0);
+        QCOMPARE(root->property("zoom").toReal(), 2.0);
+        // The biggest step is the last.
+        QTest::keyClick(window, Qt::Key_Equal, Qt::ControlModifier);
+        QCOMPARE(root->property("zoom").toReal(), 2.0);
+        QTest::keyClick(window, Qt::Key_0, Qt::ControlModifier);
+        QTRY_COMPARE(rowHeight(), 32.0);
+        QTest::keyClick(window, Qt::Key_Minus, Qt::ControlModifier);
+        QTRY_COMPARE(rowHeight(), 24.0);
+    }
+
     void listKeepsARenamedNestedItemSelected()
     {
         QTemporaryDir home, plugins;
@@ -8029,7 +8105,6 @@ private slots:
                 width: 900; height: 620; visible: true
                 property string viewMode: "list"
                 property real zoom: 1
-                property real listZoom: 1
                 property bool split: false
                 property bool helpVisible: false
                 property var activePane: null

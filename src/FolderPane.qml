@@ -33,31 +33,9 @@ FocusScope {
     property real zoom: host ? host.zoom : 1
     onZoomChanged: if (host && !closable) host.zoom = zoom
     readonly property var zoomSteps: [0.75, 1, 1.25, 1.5, 2]
-    // The list's rows have steps of their own, three: its normal size, and
-    // two bigger. They're kept apart from the grid's, so each view is
-    // remembered at the size it was left at.
-    property real listZoom: host ? host.listZoom : 1
-    onListZoomChanged: if (host && !closable) host.listZoom = listZoom
-    readonly property var listZoomSteps: [1, 1.5, 2]
-    // The step `step` away from `current` among `steps`, held to the ends; a
-    // value that's none of them (a hand-edited setting) counts as normal.
-    function stepped(steps, current, step) {
-        const at = steps.indexOf(current)
-        return steps[Math.max(0, Math.min(steps.length - 1, (at < 0 ? steps.indexOf(1) : at) + step))]
-    }
-    // The keys and the wheel size what's showing: the list's rows, or else
-    // the grid's tiles.
     function zoomBy(step) {
-        if (viewMode === "list")
-            listZoom = stepped(listZoomSteps, listZoom, step)
-        else
-            zoom = stepped(zoomSteps, zoom, step)
-    }
-    function resetZoom() {
-        if (viewMode === "list")
-            listZoom = 1
-        else
-            zoom = 1
+        const at = zoomSteps.indexOf(zoom)
+        zoom = zoomSteps[Math.max(0, Math.min(zoomSteps.length - 1, (at < 0 ? 1 : at) + step))]
     }
     function cycleView() {
         viewMode = viewMode === "columns" ? "list" : viewMode === "list" ? "grid" : "columns"
@@ -227,7 +205,7 @@ FocusScope {
     Shortcut { sequence: "Ctrl+3"; enabled: pane.active; onActivated: pane.viewMode = "grid" }
     Shortcut { sequences: [StandardKey.ZoomIn, "Ctrl+="]; enabled: pane.active; onActivated: pane.zoomBy(1) }
     Shortcut { sequences: [StandardKey.ZoomOut]; enabled: pane.active; onActivated: pane.zoomBy(-1) }
-    Shortcut { sequence: "Ctrl+0"; enabled: pane.active; onActivated: pane.resetZoom() }
+    Shortcut { sequence: "Ctrl+0"; enabled: pane.active; onActivated: pane.zoom = 1 }
     Shortcut { sequences: ["Return", "Enter"]; enabled: pane.keys; onActivated: if (pane.current.path) backend.open(pane.current.path) }
     Shortcut { sequences: ["Backspace", "Alt+Up"]; enabled: pane.keys; onActivated: backend.goUp() }
     Shortcut { sequences: ["Alt+Left", "Back"]; enabled: pane.active; onActivated: backend.back() }
@@ -503,9 +481,31 @@ FocusScope {
                 folder: backend.path
                 items: view.item
             }
+
+            // Ctrl+scroll over the grid or the list steps its size, as Ctrl+=
+            // and Ctrl+- do. It's the view's own, so it's asked before the
+            // view scrolls.
+            WheelHandler {
+                parent: view.item
+                enabled: pane.viewMode !== "columns"
+                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                acceptedModifiers: Qt.ControlModifier
+                // A touchpad sends many small deltas: a step per notch's worth
+                // (120), and nothing for an event that doesn't move up or down.
+                property real pending: 0
+                onWheel: (event) => {
+                    // Every whole notch is a step; the rest waits for the next event.
+                    pending += event.angleDelta.y
+                    while (Math.abs(pending) >= 120) {
+                        const step = pending > 0 ? 1 : -1
+                        pane.zoomBy(step)
+                        pending -= step * 120
+                    }
+                }
+            }
         }
-        Component { id: gridView; FolderGrid { zoom: pane.zoom; onZoomRequested: (step) => pane.zoomBy(step) } }
-        Component { id: listView; FolderList { zoom: pane.listZoom; onZoomRequested: (step) => pane.zoomBy(step) } }
+        Component { id: gridView; FolderGrid { zoom: pane.zoom } }
+        Component { id: listView; FolderList { zoom: pane.zoom } }
         Component { id: columnsView; FolderColumns { detailsPane: pane } }
     }
 

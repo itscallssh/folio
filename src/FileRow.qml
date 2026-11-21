@@ -34,10 +34,10 @@ Item {
     // In the list, a tree: each level indented, and a folder's arrow opens
     // it in place (or closes it).
     property bool tree: false
-    // How much bigger than the columns' rows this one is: its height and
-    // its picture grow, the name and details don't, as with the grid's
-    // tiles. The list sets it from its size step.
+    // The list's size step: the row's height and picture grow with it, the
+    // name and details don't, as with the grid's tiles.
     property real zoom: 1
+    readonly property int picture: Math.round(20 * zoom)
 
     signal clicked(int modifiers)
     signal activated()
@@ -84,13 +84,9 @@ Item {
 
     RowLayout {
         anchors.fill: parent
-        // Each level is indented by half the picture's width plus a fixed
-        // 10: an open folder's items have their arrow under the folder's
-        // own picture at any size. (The arrow is a fixed 18 wide, so
-        // indenting by the picture's whole width, which grows twice as
-        // fast as the picture's middle moves, left the arrows drifting
-        // further out with every size step.)
-        anchors.leftMargin: row.tree ? 4 + row.depth * (Math.round(10 * row.zoom) + 10) : 14
+        // Each level is indented by half a picture and 10, which keeps an
+        // open folder's arrows under its picture at any size.
+        anchors.leftMargin: row.tree ? 4 + row.depth * (Math.round(row.picture / 2) + 10) : 14
         anchors.rightMargin: 14
         spacing: 12
 
@@ -119,8 +115,8 @@ Item {
         }
 
         Item {
-            implicitWidth: Math.round(20 * row.zoom)
-            implicitHeight: Math.round(20 * row.zoom)
+            implicitWidth: row.picture
+            implicitHeight: row.picture
             Image {
                 id: thumb
                 anchors.fill: parent
@@ -142,8 +138,7 @@ Item {
             }
             Rectangle {
                 id: rowMask
-                width: Math.round(20 * row.zoom)
-                height: Math.round(20 * row.zoom)
+                anchors.fill: parent
                 radius: Math.min(4, theme.radius)
                 visible: false
                 layer.enabled: true

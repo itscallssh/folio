@@ -72,8 +72,6 @@ GridView {
     // narrow pane (one side of a split) caps it at a tile its width holds.
     property real zoom: 1
     readonly property real tileZoom: Math.max(0.5, Math.min(zoom, (width - 40) / 128))
-    signal zoomRequested(int step)
-    ZoomWheel { onZoomRequested: (step) => grid.zoomRequested(step) }
     // The rows reflow, so bring the cursor's tile back into view.
     onTileZoomChanged: Qt.callLater(() => { if (currentIndex >= 0) { forceLayout(); positionViewAtIndex(currentIndex, GridView.Contain) } })
     readonly property int columns: Math.max(1, Math.floor(width / (40 + 128 * tileZoom)))

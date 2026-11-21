@@ -17,7 +17,6 @@
         <file>HelpOverlay.qml</file>
         <file>Selecting.qml</file>
         <file>Band.qml</file>
-        <file>ZoomWheel.qml</file>
         <file>FolioMenu.qml</file>
         <file>FolioMenuItem.qml</file>
         <file>MenuLine.qml</file>
