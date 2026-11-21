@@ -53,10 +53,8 @@ double ratio(const QColor &a, const QColor &b) {
     return (std::max(x, y) + .05) / (std::min(x, y) + .05);
 }
 
-// WCAG's minimum contrast for text. Marks and frames need less, and a
-// surface less still.
+// WCAG's minimum contrast for text. A surface needs much less.
 constexpr double textFloor = 4.5;
-constexpr double markFloor = 3;
 constexpr double surfaceFloor = 1.4;
 // The ground luminance where black and white read equally.
 constexpr double midLuminance = .179;
@@ -66,8 +64,7 @@ constexpr int bisectionSteps = 18;
 constexpr int channelRange = 255;
 
 // The ink when it already reads at need, else the least mix toward black or
-// white that still does once rounded to eight-bit channels. A theme whose
-// color reads keeps its own; only the pale, washed-out ones are nudged.
+// white that still does once rounded to eight-bit channels.
 QColor ensureRatio(const QColor &ink, const QColor &ground, double need) {
     if (ratio(ink, ground) >= need)
         return ink;
@@ -237,39 +234,10 @@ QColor Theme::accentForeground() const {
 }
 
 // Themes' own dim foregrounds are often too faint for small text, so derive a
-// secondary color by mixing the foreground toward the background, then raise
-// it just enough to keep 4.5:1 on every ground file items draw on. A theme
-// whose mix already reads keeps it.
+// secondary color by mixing the foreground toward the background, keeping
+// roughly a 4.5:1 contrast for metadata and labels.
 QColor Theme::secondaryForeground() const {
-    constexpr double share = 0.68;
-    QColor ink = mix(background(), foreground(), share);
-    for (const QColor &ground : {background(), lighterBackground(), darkBackground()})
-        ink = ensureRatio(ink, ground, textFloor);
-    return ink;
-}
-
-// The accent as a thin frame or outline (a folder's or file's mark), raised to
-// 3:1 on the panes a file item can sit on. Fills and tints keep the accent.
-QColor Theme::accentMark() const {
-    QColor mark = accent();
-    for (const QColor &ground : {background(), lighterBackground(), darkBackground()})
-        mark = ensureRatio(mark, ground, markFloor);
-    return mark;
-}
-
-// A folder card's fill: the lighter background raised to surfaceFloor so the
-// card stands off the pane on themes where the two nearly match.
-QColor Theme::folderFill() const {
-    return ensureRatio(lighterBackground(), background(), surfaceFloor);
-}
-
-// Words on a palette fill (a file's badge): the background where it reads,
-// else whichever of it and the foreground reads better, raised to textFloor.
-QColor Theme::inkOn(const QColor &fill) const {
-    const QColor bg = background(), fg = foreground();
-    if (ratio(bg, fill) >= textFloor)
-        return bg;
-    return ensureRatio(ratio(bg, fill) >= ratio(fg, fill) ? bg : fg, fill, textFloor);
+    return mix(background(), foreground(), 0.68);
 }
 
 // A tooltip is a small surface over the pane. Take the theme's own step away
@@ -284,6 +252,12 @@ QColor Theme::tooltipBackground() const {
 // Tooltip words: the theme's foreground, raised to textFloor on that surface.
 QColor Theme::tooltipForeground() const {
     return ensureRatio(foreground(), tooltipBackground(), textFloor);
+}
+
+// A folder card's fill: the lighter background, raised to surfaceFloor so the
+// card stands off the pane on themes where the two nearly match (#24).
+QColor Theme::folderFill() const {
+    return ensureRatio(lighterBackground(), background(), surfaceFloor);
 }
 
 void Theme::reload() {

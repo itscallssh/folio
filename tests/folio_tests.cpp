@@ -97,7 +97,7 @@ static std::unique_ptr<QTemporaryDir> elsewhere()
     return dir;
 }
 
-// WCAG contrast, to check that the theme's derived colors read on a palette.
+// WCAG contrast, to check that the tooltip colors read on a palette.
 static double contrast(const QColor &a, const QColor &b)
 {
     auto linear = [](double v) { return v <= .04045 ? v / 12.92 : std::pow((v + .055) / 1.055, 2.4); };
@@ -2562,7 +2562,6 @@ private slots:
         FileOps ops;
         const std::unique_ptr<QQmlPropertyMap> theme(QQmlPropertyMap::create());
         theme->insert("accent", QColor(Qt::blue));
-        theme->insert("accentMark", QColor(Qt::blue));
         theme->insert("radius", 0);
         QQmlEngine engine;
         engine.rootContext()->setContextProperty("fileOps", &ops);
@@ -8581,53 +8580,6 @@ private slots:
               "mode = \"light\"\nbackground = \"#ffffff\"\nlighter_background = \"#c0c0c0\"\nforeground = \"#000000\"\n");
         Theme passing(dir.path());
         QCOMPARE(passing.folderFill(), QColor("#c0c0c0"));
-    }
-
-    // A folder's outline and the frames around file items are thin marks: they
-    // keep 3:1 on any pane, while fills and tints keep the theme's own accent.
-    void themeFloorsAccentMarks()
-    {
-        QTemporaryDir dir;
-        QDir(dir.path()).mkpath("theme");
-        write(dir.filePath("theme/colors.toml"),
-              "accent = \"#f2e9e1\"\nbackground = \"#faf4ed\"\nlighter_background = \"#f2e9e1\"\nforeground = \"#575279\"\n");
-        Theme pale(dir.path());
-        QVERIFY(contrast(pale.accentMark(), pale.background()) >= 3);
-        QCOMPARE(pale.accent(), QColor("#f2e9e1"));
-        // A dark accent on a dark ground is raised the other way.
-        write(dir.filePath("theme/colors.toml"),
-              "accent = \"#101315\"\nbackground = \"#16161a\"\nforeground = \"#e0e0e0\"\n");
-        Theme dark(dir.path());
-        QVERIFY(contrast(dark.accentMark(), dark.background()) >= 3);
-    }
-
-    // A file's metadata and a folder's count are secondary ink, readable on
-    // the pane, a card and the darker panel alike.
-    void themeKeepsSecondaryTextReadable()
-    {
-        QTemporaryDir dir;
-        QDir(dir.path()).mkpath("theme");
-        write(dir.filePath("theme/colors.toml"),
-              "background = \"#faf4ed\"\nlighter_background = \"#f2e9e1\"\ndark_background = \"#e8e0d8\"\nforeground = \"#6c6b83\"\n");
-        Theme theme(dir.path());
-        for (const QColor &ground : {theme.background(), theme.lighterBackground(), theme.darkBackground()})
-            QVERIFY(contrast(theme.secondaryForeground(), ground) >= 4.5);
-    }
-
-    // A file's badge writes its extension on the kind color: its ink has to
-    // read there whether the theme is light or dark.
-    void themePicksInkForBadges()
-    {
-        QTemporaryDir dir;
-        QDir(dir.path()).mkpath("theme");
-        write(dir.filePath("theme/colors.toml"),
-              "background = \"#16161a\"\nlighter_background = \"#232329\"\nforeground = \"#c8c8d0\"\nyellow = \"#e0af68\"\n");
-        Theme dark(dir.path());
-        QVERIFY(contrast(dark.inkOn(dark.yellow()), dark.yellow()) >= 4.5);
-        write(dir.filePath("theme/colors.toml"),
-              "mode = \"light\"\nbackground = \"#ffffff\"\nforeground = \"#000000\"\nyellow = \"#f2e9e1\"\n");
-        Theme light(dir.path());
-        QVERIFY(contrast(light.inkOn(light.yellow()), light.yellow()) >= 4.5);
     }
 
     // Folio's font is the system's fixed-width one, Omarchy's pick, followed

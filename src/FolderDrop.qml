@@ -34,7 +34,7 @@ DropArea {
         visible: area.containsDrag
         color: Qt.alpha(theme.accent, 0.05)
         border.width: 2
-        border.color: theme.accentMark
+        border.color: theme.accent
         radius: Math.min(6, theme.radius)
     }
 }

@@ -33,10 +33,7 @@ class Theme : public QObject {
     // from the pane and text that reads on it, in light and dark themes alike.
     Q_PROPERTY(QColor tooltipBackground READ tooltipBackground NOTIFY changed)
     Q_PROPERTY(QColor tooltipForeground READ tooltipForeground NOTIFY changed)
-    // Contrast floors derived from the palette: marks for thin frames and
-    // outlines, folderFill for a card standing off the pane. Fills and tints
-    // keep the theme's own colors.
-    Q_PROPERTY(QColor accentMark READ accentMark NOTIFY changed)
+    // A folder card's fill: the lighter background, lifted off the pane.
     Q_PROPERTY(QColor folderFill READ folderFill NOTIFY changed)
     // The system's fixed-width font (Omarchy's pick of font), by its real
     // family, and how much bigger or smaller than Omarchy's default size the
@@ -71,10 +68,7 @@ public:
     int radius() const { return m_radius; }
     QColor tooltipBackground() const;
     QColor tooltipForeground() const;
-    QColor accentMark() const;
     QColor folderFill() const;
-    // An ink that reads on a palette fill, for a file's badge.
-    Q_INVOKABLE QColor inkOn(const QColor &fill) const;
     QString fontFamily() const { return m_fontFamily; }
     qreal textScale() const { return m_textScale; }
 

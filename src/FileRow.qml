@@ -71,7 +71,7 @@ Item {
         anchors.rightMargin: 4
         radius: Math.min(4, theme.radius)
         border.width: folderDrop.containsDrag ? 2 : 0
-        border.color: theme.accentMark
+        border.color: theme.accent
         color: row.current || folderDrop.containsDrag ? Qt.alpha(theme.accent, 0.18)
              : row.trail ? Qt.alpha(theme.foreground, 0.08)
              : hover.hovered ? Qt.alpha(theme.foreground, 0.05)
@@ -143,9 +143,7 @@ Item {
                 visible: !thumb.visible
                 name: row.glyph
                 size: 16
-                // A folder's mark is the theme's accent, lifted off the row
-                // when a theme's own accent is too pale; a file stays quiet.
-                color: row.isDir && !row.cut ? theme.accentMark : theme.secondaryForeground
+                color: row.isDir && !row.cut ? theme.accent : theme.secondaryForeground
             }
         }
         // The name and the date are aligned explicitly, so that they're
