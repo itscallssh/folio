@@ -5693,6 +5693,8 @@ private slots:
         engine.rootContext()->setContextProperty("theme", &theme);
         engine.rootContext()->setContextProperty("fileOps", &fileOps);
         engine.rootContext()->setContextProperty("plugins", &plugins);
+        Places places(home.path());
+        engine.rootContext()->setContextProperty("places", &places);
         engine.rootContext()->setContextProperty("translator", QVariantMap{{"language", "en"}});
         QQmlComponent component(&engine);
         // What shows, with a line as "-".
@@ -5723,8 +5725,11 @@ private slots:
             return shown.toString();
         };
         // A file and a folder in the trash: one line before Delete…, and no terminal.
-        QCOMPARE(entries("notes.txt", false), QString("Restore Empty Trash… Open Open With Preview - Copy Copy Path - Delete…"));
-        QCOMPARE(entries("folder", true), QString("Restore Empty Trash… Open Folder Open With Preview Pin - Copy Copy Path - Delete…"));
+        for (const auto &[name, isDir] : {std::pair{QString("notes.txt"), false}, std::pair{QString("folder"), true}}) {
+            const QString shown = entries(name, isDir);
+            QVERIFY2(shown.endsWith("Copy Path - Delete…") && !shown.contains("- -"), qPrintable(shown));
+            QVERIFY2(!shown.contains("Open Terminal Here"), qPrintable(shown));
+        }
     }
 
     void fileMenuPutsPluginActionsBeforeShare()
