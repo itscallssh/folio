@@ -196,7 +196,8 @@ FolioMenu {
         keys: "Ctrl+Shift+N"
         onTriggered: fileOps.newFolder(fileMenu.folder)
     }
-    MenuLine { shown: fileMenu.forFiles }
+    // In the trash nothing an item gets below shows, so no line opens it.
+    MenuLine { shown: fileMenu.forFiles && !(fileMenu.forItem && fileMenu.trashView) }
     // Archives are extracted, not compressed again.
     readonly property bool archives: !trashView && forItem && forFiles && fileOps.canExtract(paths)
     FolioMenuItem {

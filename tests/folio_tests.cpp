@@ -5676,6 +5676,57 @@ private slots:
         QCOMPARE(result->copy, QString("https://git.example.com/a.txt"));
     }
 
+    void fileMenuDrawsNoLinesTogetherInTheTrash()
+    {
+        QTemporaryDir data, home;
+        const auto restore = dataHomeAt(data.path());
+        QVERIFY(QDir().mkpath(data.filePath("Trash/files/folder")));
+        QVERIFY(QDir().mkpath(data.filePath("Trash/info")));
+        write(data.filePath("Trash/files/notes.txt"), "x");
+        Plugins plugins("en", {}, home.filePath("folio.conf"));
+        Backend backend(home.path());
+        backend.setPlugins(&plugins);
+        Theme theme(home.filePath("theme"));
+        FileOps fileOps;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("fileOps", &fileOps);
+        engine.rootContext()->setContextProperty("plugins", &plugins);
+        engine.rootContext()->setContextProperty("translator", QVariantMap{{"language", "en"}});
+        QQmlComponent component(&engine);
+        // What shows, with a line as "-".
+        component.setData("import QtQuick\n"
+                          "Window {\n"
+                          "    width: 800; height: 600; visible: true\n"
+                          "    FileMenu { id: menu }\n"
+                          "    function entries(target, folder) {\n"
+                          "        menu.show(target, folder)\n"
+                          "        const shown = []\n"
+                          "        for (let i = 0; i < menu.count; ++i) {\n"
+                          "            const entry = menu.itemAt(i)\n"
+                          "            if (entry && entry.visible) shown.push(entry.text || (entry.subMenu ? entry.subMenu.title : '-'))\n"
+                          "        }\n"
+                          "        menu.close()\n"
+                          "        return shown.join(' ')\n"
+                          "    }\n"
+                          "}\n",
+                          QUrl::fromLocalFile(sourceFolder() + "/FileMenuTest.qml"));
+        std::unique_ptr<QObject> window(component.create());
+        QVERIFY2(window, qPrintable(component.errorString()));
+        const QString trash = data.filePath("Trash/files");
+        const auto entries = [&](const QString &name, bool isDir) {
+            QVariant shown;
+            const QVariant target = QVariantMap{{"path", trash + "/" + name}, {"name", name}, {"isDir", isDir}};
+            QMetaObject::invokeMethod(window.get(), "entries", Q_RETURN_ARG(QVariant, shown),
+                                      Q_ARG(QVariant, target), Q_ARG(QVariant, trash));
+            return shown.toString();
+        };
+        // A file and a folder in the trash: one line before Delete…, and no terminal.
+        QCOMPARE(entries("notes.txt", false), QString("Restore Empty Trash… Open Open With Preview - Copy Copy Path - Delete…"));
+        QCOMPARE(entries("folder", true), QString("Restore Empty Trash… Open Folder Open With Preview Pin - Copy Copy Path - Delete…"));
+    }
+
     void fileMenuPutsPluginActionsBeforeShare()
     {
         QTemporaryDir home, folder;
