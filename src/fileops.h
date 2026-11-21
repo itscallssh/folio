@@ -35,7 +35,7 @@ public:
 
     QString busy() const { return m_busy; }
     bool canPaste() const;
-    // How many items the clipboard holds cut, and whether `path` is one, which the views draw dimmer.
+    // How many items the clipboard holds cut, and whether `path` is one or inside one, which the views draw dimmer.
     int cutCount() const { return int(m_cut.size()); }
     Q_INVOKABLE bool isCut(const QString &path) const;
 

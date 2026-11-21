@@ -160,7 +160,11 @@ bool FileOps::canPaste() const {
 }
 
 bool FileOps::isCut(const QString &path) const {
-    return m_cut.contains(QDir::cleanPath(path));
+    // The item itself or a folder above it, which takes it along.
+    for (QString at = QDir::cleanPath(path); at.size() > 1; at = QFileInfo(at).path())
+        if (m_cut.contains(at))
+            return true;
+    return false;
 }
 
 bool FileOps::shiftHeld() {

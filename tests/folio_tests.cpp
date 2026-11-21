@@ -2195,6 +2195,11 @@ private slots:
         ops.cut({from.filePath("a.txt")});
         QTRY_VERIFY(other.isCut(from.filePath("a.txt")));
         QVERIFY(ops.isCut(from.filePath("a.txt")) && !ops.isCut(from.filePath("b.txt")));
+        // What's inside a cut folder goes with it, but not a neighbour whose name starts the same.
+        QVERIFY(QDir(from.path()).mkpath("box/inner") && QDir(from.path()).mkpath("box2"));
+        ops.cut({from.filePath("box")});
+        QTRY_VERIFY(ops.isCut(from.filePath("box/inner")));
+        QVERIFY(!ops.isCut(from.filePath("box2")) && !ops.isCut(from.path()));
         ops.copy({from.filePath("a.txt")});
         QTRY_COMPARE(ops.cutCount(), 0);
         ops.cut({from.filePath("b.txt")});
